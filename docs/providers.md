@@ -36,7 +36,7 @@ each provider's code. Measured against the service: Tidal, Internet Archive and 
 | qqmusic, neteasecloudmusic, zvuk_music | FLAC tiers | | expected | | HTTP: HEAD |
 | kion_music, yandex_music | FLAC tiers | | expected | | HEAD where the stream is HTTP; their custom streams unknown |
 | plex, transcode | no (Opus HLS) | | | yes | transcoded on the fly |
-| apple_music | yes (ALAC) | | | yes | encrypted HTTP |
+| apple_music | no (AAC 256 kbps) | | expected | | catalogue tracks are a Widevine-encrypted file URL, decrypted by ffmpeg with the content key; encryption should not change the size, so HEAD should work (not tested); lossy source |
 | spotify, spotify_connect | lossless tier | | | yes | audio comes through librespot, no file URL |
 
 Not listed: lossy-only catalogues (ytmusic, soundcloud, bandcamp, pandora, musicme, nicovideo),
