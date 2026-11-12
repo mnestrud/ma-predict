@@ -72,3 +72,14 @@ and Raumfeld, which are never sent a fixed length by default.
 
 The work covers FLAC output only, and applies when the source file size is known before the
 headers are sent (local files, WebDAV, Deezer, feiniu_music).
+
+## References
+
+Two papers on predicting encoder output size, used for the study design:
+
+- Telili, Hamidouche, Amirpour, Fezza, Morin, Timmerer (2023).
+  *Convex Hull Prediction Methods for Bitrate Ladder Construction: Design, Evaluation, and Comparison.*
+  https://arxiv.org/abs/2310.15163
+- Premkumar, Rajendran, Menon, Herglotz (2026).
+  *Content-Driven Frame-Level Bit Prediction for Rate Control in Versatile Video Coding.*
+  https://arxiv.org/abs/2602.06242
