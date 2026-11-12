@@ -54,3 +54,21 @@ When it finishes, send back these four files from the output folder (SEED is a n
 Do NOT send paths.local.json: it holds your file names.
 
 ```
+
+## Scope
+
+The estimate matters only for players that Music Assistant sends a fixed `Content-Length`.
+As of Music Assistant `server` branch `dev`, commit 21f7f90cb:
+
+| Player | Fixed length |
+|---|---|
+| Bluesound | always (setting hidden) |
+| Chromecast, Google-made, not a group | by default |
+| Yandex Station | always (required) |
+| Any other player | only when the user sets its HTTP profile to forced content length |
+
+Not in scope: Chromecast groups and non-Google Cast devices, Squeezelite, Home Assistant players
+and Raumfeld, which are never sent a fixed length by default.
+
+The work covers FLAC output only, and applies when the source file size is known before the
+headers are sent (local files, WebDAV, Deezer, feiniu_music).
