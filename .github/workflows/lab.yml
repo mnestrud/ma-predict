@@ -83,6 +83,7 @@ jobs:
           [ -n "$logs" ] || { echo "no Perfect FLAC line in any ma.log"; exit 1; }
           grep -h "Perfect FLAC" $logs | sed 's/.*Perfect FLAC/Perfect FLAC/' | sort | uniq -c
           ! grep -hq "Perfect FLAC: \(short\|over\)\|Perfect FLAC: passing" $logs
+          [ "$(grep -hc "Perfect FLAC: exact" $logs | paste -sd+ | bc)" -ge 3 ]
       - name: Keep the run folders
         if: always()
         uses: actions/upload-artifact@v7
