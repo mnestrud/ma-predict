@@ -5,8 +5,8 @@ name: Lab
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ci-lab]
+  schedule:
+    - cron: "41 7 * * 1"
 
 permissions:
   contents: read

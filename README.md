@@ -8,6 +8,7 @@ Work in progress: a better estimate of the FLAC stream size that
 - [Comparison: 0.747 vs v1 vs V2](docs/comparison.md)
 - [Model parameters explained](docs/model.md)
 - [Source size per provider, and V2 against a live server's measured sizes](docs/providers.md)
+- [Perfect FLAC and Tidal exact size: two experimental patches](docs/perfect-flac.md) ([patch files](patches/))
 - Model files: [v1](models/model_v1.json), [V2](models/model_v2.json)
 - Survey script: [flac_size_survey.py](flac_size_survey.py)
 
