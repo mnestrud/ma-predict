@@ -76,3 +76,57 @@ Limits: B was not checked against a full download. A assumes equal-length segmen
 short last segment. The residual of A exceeds integer truncation on 86 of 196 streams; the
 cause is not established. The size is that of Tidal's source container, not of Music
 Assistant's output stream.
+
+## V2 against measured sizes on a live server
+
+Status 2026-11-12. Music Assistant keeps the measured size of every fully streamed track
+(content-length cache). One household server had 699 such rows written with the current encoder
+settings: 165 from local files, 534 from Tidal. V2 ([model](model.md)) was scored against them.
+Error = (announced − measured) / measured; "median" is the median absolute error.
+
+Inputs: for local rows, the file size on disk; for Tidal rows, the source size from method A
+above at `HI_RES_LOSSLESS` (514 tracks, one playback-info request per 3 s, no rate-limit
+answers). Track normalization is off on this server; three players have a parametric EQ.
+
+Rows kept: 144 local and 425 Tidal. Dropped: 4 local rows without a matching file, 4 Tidal
+tracks now served lossy, and 17 local and 105 Tidal rows whose cached duration differs from the
+source by more than 1.5 s (not examined).
+
+The cache key holds the track and the output format, not the player, so it does not say whether
+DSP ran. Only the 16-bit to 24-bit cell depends on that; it is listed separately.
+
+### Samples not changed by DSP, or the formula is the same either way
+
+| Source → output | Source | Rows | 0.747 median | V2 median | V2 within 5 % | V2 short / long |
+|---|---|---|---|---|---|---|
+| 16/44.1 → 16/44.1 | local | 66 | 13.8 % | 1.39 % | 89 % | −7.6 % / +12.2 % |
+| 16/44.1 → 16/44.1 | Tidal | 172 | 6.7 % | 1.27 % | 87 % | −8.5 % / +29.0 % |
+| 24/44.1 → 24/44.1 | local | 5 | 9.5 % | 1.28 % | 100 % | −3.2 % / +1.8 % |
+| 24/44.1 → 24/44.1 | Tidal | 43 | 6.5 % | 0.77 % | 100 % | −3.2 % / +2.2 % |
+| 24/48 → 24/48 | local | 26 | 8.5 % | 0.63 % | 100 % | −1.8 % / +2.2 % |
+| 24/48 → 24/48 | Tidal | 39 | 6.3 % | 1.18 % | 100 % | −3.2 % / −0.1 % |
+| 24/96 → 24/48 (resampled) | Tidal | 49 | 7.2 % | 2.90 % | 69 % | −8.1 % / +31.1 % |
+| 24/192 → 24/48 (resampled) | Tidal | 7 | 7.7 % | 6.64 % | 29 % | −9.4 % / +10.0 % |
+
+### 16/44.1 → 24/44.1: depends on whether DSP ran
+
+| Assumption | Source | Rows | V2 median | V2 within 5 % | V2 short / long |
+|---|---|---|---|---|---|
+| untouched (zero-padded) | local | 47 | 41.1 % | 30 % | −53.5 % / +2.2 % |
+| DSP changed the samples | local | 47 | 4.78 % | 60 % | +0.4 % / +119.9 % |
+| better of the two per row | local | 47 | 3.55 % | 89 % | −0.4 % / +6.4 % |
+| untouched (zero-padded) | Tidal | 114 | 39.3 % | 8 % | −61.7 % / +6.7 % |
+| DSP changed the samples | Tidal | 114 | 2.74 % | 76 % | −2.7 % / +73.1 % |
+| better of the two per row | Tidal | 114 | 2.68 % | 84 % | −2.7 % / +19.0 % |
+
+0.747 in this cell: median 12.5 % (local), 7.6 % (Tidal). Rows that fit "DSP changed" better:
+33 of 47 local, 102 of 114 Tidal. "Better of the two" is a best case: Music Assistant knows at
+play time whether DSP runs, this test does not.
+
+### Reading
+
+- V2 was fitted on local files only. The Tidal source size from method A works in it unchanged.
+- With an EQ, V2 announces too much rather than too little (local median +4.8 %); V2 has no EQ term.
+- Resampled hi-res is the weak cell: V2's resample constant is provisional (5 tracks, one artist).
+- Not examined: single-row outliers, the duration-mismatch rows, and whether Tidal served the
+  same master when a cache row was written.
