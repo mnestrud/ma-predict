@@ -1,4 +1,4 @@
-# Predictive Encoding for Music Assistant File Size Estimation
+# Predictive Encoding for Music Assistant Stream Size Estimation
 
 Work in progress: a better estimate of the FLAC stream size that
 [Music Assistant](https://github.com/music-assistant/server) announces in the HTTP
@@ -7,6 +7,7 @@ Work in progress: a better estimate of the FLAC stream size that
 - [Findings so far](docs/findings.md)
 - [Comparison: 0.747 vs v1 vs V2](docs/comparison.md)
 - [Model parameters explained](docs/model.md)
+- [Source size per provider](docs/providers.md)
 - Model files: [v1](models/model_v1.json), [V2](models/model_v2.json)
 - Survey script: [flac_size_survey.py](flac_size_survey.py)
 
@@ -71,7 +72,8 @@ Not in scope: Chromecast groups and non-Google Cast devices, Squeezelite, Home A
 and Raumfeld, which are never sent a fixed length by default.
 
 The work covers FLAC output only, and applies when the source file size is known before the
-headers are sent (local files, WebDAV, Deezer, feiniu_music).
+headers are sent (local files, WebDAV, Deezer, feiniu_music; see
+[Source size per provider](docs/providers.md)).
 
 ## References
 
