@@ -8,7 +8,7 @@ lists which music providers supply one today (`StreamDetails.size`) and which do
 Method: a scan of every `StreamDetails(...)` construction under `music_assistant/providers` for
 a `size=` argument. 72 providers implement `get_stream_details`; `music247e` builds its details
 elsewhere and was not scanned. "Lossless" is read from the content types and quality names in
-each provider's code. Only Tidal was measured against the service.
+each provider's code. Measured against the service: Tidal, Internet Archive and phish.in.
 
 ## Checklist
 
