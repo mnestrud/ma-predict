@@ -1,5 +1,5 @@
 diff --git a/music_assistant/controllers/streams/controller.py b/music_assistant/controllers/streams/controller.py
-index 7524ac9af..9eb219b49 100644
+index 7524ac9af..b2e3766bd 100644
 --- a/music_assistant/controllers/streams/controller.py
 +++ b/music_assistant/controllers/streams/controller.py
 @@ -123,6 +123,12 @@ from music_assistant.helpers.ffmpeg import (
@@ -65,7 +65,17 @@ index 7524ac9af..9eb219b49 100644
              first_chunk_received = False
              bytes_sent = 0
              stream_completed = False
-@@ -1313,7 +1341,8 @@ class StreamsController(CoreController):
+@@ -1282,6 +1310,9 @@ class StreamsController(CoreController):
+                 stream_failure = err
+             finally:
+                 self._active_output_streams -= 1
++            if perfect_flac and stream_completed and perfect_flac.result.status == "short":
++                # the body ends before the announced length: close, or the player waits
++                resp.force_close()
+             if stream_failure is not None or queue_item.streamdetails.stream_error:
+                 # every stage in between replaces the message with one of its own, so
+                 # the reason worth reporting is the one at the bottom of the chain
+@@ -1313,7 +1344,8 @@ class StreamsController(CoreController):
                          self.mass,
                          queue_item.uri,
                          output_format,
@@ -92,10 +102,10 @@ index 7c6b5d702..988f20bec 100644
        "description": "Log level for the Smart Fades mixer and analyzer."
 diff --git a/music_assistant/helpers/perfect_flac.py b/music_assistant/helpers/perfect_flac.py
 new file mode 100644
-index 000000000..8c422fa9f
+index 000000000..e3144d710
 --- /dev/null
 +++ b/music_assistant/helpers/perfect_flac.py
-@@ -0,0 +1,932 @@
+@@ -0,0 +1,926 @@
 +"""
 +Perfect FLAC: make a FLAC stream end on exactly the announced Content-Length.
 +
@@ -143,13 +153,17 @@ index 000000000..8c422fa9f
 +MARGIN_MEASURED: Final[float] = 0.02
 +MARGIN_MEASURED_BYTES: Final[int] = 65536
 +
-+# seconds of encoded audio held back to land on the exact byte at the end
++# least seconds of encoded audio held back to land on the exact byte at the end
 +WINDOW_SECONDS: Final[float] = 6.0
-+# share of what the window can fill that the stream is steered to leave for the end
-+RESERVE_SHARE: Final[float] = 0.6
-+WINDOW_MAX_SECONDS: Final[float] = 30.0
-+STEER_CAUTION: Final[float] = 0.08
-+STEER_AFTER_SECONDS: Final[float] = 10.0
++# the track may run this much longer than its stated duration before bytes added early
++# could make the stream too large
++DURATION_GUARD_SECONDS: Final[float] = 5.0
++# room in the held-back frames, relative to what they have to take at the end
++WINDOW_HEADROOM: Final[float] = 1.3
++# frame header, subframe headers and checksum on top of the uncompressed samples
++RAW_FRAME_OVERHEAD: Final[float] = 0.005
++# left for the held-back frames, which can only grow in steps of a few kB
++LANDING_RESERVE_BYTES: Final[int] = 32768
 +DECODER_WAIT_SECONDS: Final[float] = 3.0
 +MAX_FIELD_BITS: Final[int] = 31
 +MAX_PARTITION_ORDER: Final[int] = 8
@@ -456,7 +470,6 @@ index 000000000..8c422fa9f
 +        self._source = audio_bytes
 +        self._target = plan.announced
 +        self._expected_seconds = plan.seconds
-+        self._expected_size = plan.expected
 +        self._logger = logger
 +        self._decoder = decoder or _ffmpeg_decoder
 +        self._buf = bytearray()
@@ -465,7 +478,6 @@ index 000000000..8c422fa9f
 +        self._queued_bytes = 0
 +        self._frame_bytes = 0
 +        self._passthrough = False
-+        self._carry = 0.0
 +        self._decoder_usable = True
 +        self._rate = 0
 +        self._bit_depth = 0
@@ -505,7 +517,7 @@ index 000000000..8c422fa9f
 +                    result.sent += len(held)
 +                    yield held
 +                    continue
-+                while len(self._queue) > self._window:
++                while len(self._queue) > self._window_frames():
 +                    data = await self._steer(self._pop())
 +                    result.sent += len(data)
 +                    yield data
@@ -613,16 +625,7 @@ index 000000000..8c422fa9f
 +        if not fixed or self._channels > 2 or self._bit_depth not in (16, 24):
 +            self._passthrough = True
 +            return data
-+        # hold back enough frames to fill the expected gap at the end, within limits
-+        frames = max(self._expected_seconds * self._rate / self._blocksize, 1)
-+        frame_room = self._blocksize * self._channels * MAX_FIELD_BITS / 8 - (
-+            self._expected_size / frames
-+        )
-+        wanted = (self._target - self._expected_size) / max(RESERVE_SHARE * frame_room, 1)
-+        per_second = self._rate / self._blocksize
-+        self._window = int(
-+            min(max(wanted, WINDOW_SECONDS * per_second), WINDOW_MAX_SECONDS * per_second)
-+        )
++        self._window = max(8, int(WINDOW_SECONDS * self._rate / self._blocksize))
 +        return data
 +
 +    def _take_frames(self, final: bool = False) -> None:
@@ -660,6 +663,20 @@ index 000000000..8c422fa9f
 +                return
 +            self._push(_Frame(bytes(buf), head[0], head[1], head[2]))
 +            buf.clear()
++
++    def _window_frames(self) -> int:
++        """
++        Return how many frames to hold back.
++
++        When the stream ends, the bytes kept aside for the seconds it might still have
++        run are left over; the held frames must have room for them.
++        """
++        if not self.result.frames:
++            return self._window
++        raw = self._blocksize * self._channels * self._bit_depth / 8
++        room = raw * MAX_FIELD_BITS / self._bit_depth - self._frame_bytes / self.result.frames
++        leftover = raw * DURATION_GUARD_SECONDS * self._rate / self._blocksize
++        return max(self._window, int(WINDOW_HEADROOM * leftover / max(room, 1)) + 1)
 +
 +    def _push(self, frame: _Frame) -> None:
 +        self._queue.append(frame)
@@ -716,45 +733,32 @@ index 000000000..8c422fa9f
 +
 +    async def _steer(self, frame: _Frame) -> bytes:
 +        """
-+        Return the oldest held frame, stored larger when the stream is heading for a gap.
++        Return the oldest held frame, stored larger when that cannot make the stream too large.
 +
-+        The gap at the end is projected from the bytes per sample so far. Whatever exceeds
-+        what the held-back window can fill is spread over the frames still to come.
++        No encoded frame is larger than its uncompressed samples (plus a few bytes), so the
++        rest of the track has a known largest size. A frame grows only by what would still
++        be left over if all of the rest came out that large; the gap is therefore filled
++        towards the end of the track, with frames of about the uncompressed size.
 +        """
-+        expected = int(self._expected_seconds * self._rate)
-+        seen = (self._queue[-1].number + 1) * self._blocksize if self._queue else 0
 +        data = frame.data
-+        if seen:
-+            per_sample = self._frame_bytes / seen
-+            # count on the rest of the track being larger than what came so far, so that
-+            # bytes are not added early to a stream that turns out not to need them
-+            natural_left = (
-+                self._queued_bytes
-+                + len(data)
-+                + per_sample * max(expected - seen, 0) * (1 + STEER_CAUTION)
-+            )
-+            gap = self._target - self.result.sent - natural_left
-+            frame_room = self._blocksize * self._channels * MAX_FIELD_BITS / 8 - per_sample * (
-+                self._blocksize
-+            )
-+            reserve = RESERVE_SHARE * self._window * max(frame_room, 0)
-+            excess = gap - reserve
-+            if excess > 0 and seen > STEER_AFTER_SECONDS * self._rate:
-+                frames_left = max((expected - frame.number * self._blocksize) / self._blocksize, 1)
-+                # a frame cannot grow by less than a few kB, so the share of the frames
-+                # that are left as they are is carried over to the next one that grows
-+                self._carry += excess / frames_left
-+                await self._wait_for_samples(frame)
-+                plan = self._plan(frame)
-+                if plan is not None and len(data) + self._carry >= plan.min_bytes:
-+                    size = min(len(data) + int(self._carry), plan.max_bytes)
-+                    packed = await asyncio.to_thread(_store_frame, plan, size)
-+                    if packed is not None:
-+                        self._carry -= len(packed) - len(data)
-+                        data = packed
-+                        self.result.padded_frames += 1
-+            else:
-+                self._carry = 0.0
++        if not self._queue:
++            return data
++        expected = int(self._expected_seconds * self._rate)
++        seen = (self._queue[-1].number + 1) * self._blocksize
++        # however far the track has come, count on a few more seconds than it states
++        rest = max(expected - seen, 0) + int(DURATION_GUARD_SECONDS * self._rate)
++        raw_per_sample = self._channels * self._bit_depth / 8 * (1 + RAW_FRAME_OVERHEAD)
++        largest_rest = self._queued_bytes + len(data) + raw_per_sample * rest
++        spare = int(self._target - self.result.sent - largest_rest) - LANDING_RESERVE_BYTES
++        if spare > 0 and self._decoder_usable:
++            await self._wait_for_samples(frame)
++            plan = self._plan(frame)
++            if plan is not None and len(data) + spare >= plan.min_bytes:
++                size = min(len(data) + spare, plan.max_bytes)
++                packed = await asyncio.to_thread(_store_frame, plan, size)
++                if packed is not None:
++                    data = packed
++                    self.result.padded_frames += 1
 +        self._drop_pcm(frame)
 +        return data
 +
