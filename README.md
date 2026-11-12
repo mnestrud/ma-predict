@@ -42,6 +42,7 @@ Examples:
   /opt/python3.12/bin/python3 flac_size_survey.py /mnt/music --ffmpeg /opt/ffmpeg/bin
 
 Needs Python 3.8+ and ffmpeg + ffprobe (built with libsoxr). Nothing else.
+ffmpeg must be 9.0.1 (preferred) or 7.1: the versions Music Assistant ships.
 To use a particular Python, start the script with it, as in the last example.
 Safe to stop with Ctrl-C and run again: finished work is kept.
 

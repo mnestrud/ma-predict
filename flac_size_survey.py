@@ -18,7 +18,7 @@ Each run draws its sample with a new random seed. The seed is in the file names,
 can share one output folder; an unfinished run is continued until it is done.
 No file names, tags or audio leave your machine: tracks and artists appear as short hashes.
 
-Needs: Python 3.8+, ffmpeg and ffprobe on PATH, ffmpeg built with libsoxr. All of this is checked
+Needs: Python 3.8+, ffmpeg 9.0.1 (preferred) or 7.1 and its ffprobe, ffmpeg built with libsoxr. All of this is checked
 at start, followed by a ten-second self-test on a generated tone; nothing is scanned if a check fails.
 
 Usage:
@@ -57,7 +57,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from pathlib import Path
 
-VERSION = "4 (2026-11-12, MA upstream dev 21f7f90cb)"
+VERSION = "5 (2026-11-12, MA upstream dev 21f7f90cb)"
 SEED = 0  # set per run in main(): random, or --seed, or the unfinished run found in the output folder
 AUDIO_EXT = {"flac", "m4a", "mp4", "wav", "aiff", "aif", "wv", "ape", "mp3", "aac", "ogg", "oga", "opus"}
 RATES = (44100, 48000, 88200, 96000, 176400, 192000)
@@ -633,6 +633,7 @@ Examples:
   /opt/python3.12/bin/python3 flac_size_survey.py /mnt/music --ffmpeg /opt/ffmpeg/bin
 
 Needs Python 3.8+ and ffmpeg + ffprobe (built with libsoxr). Nothing else.
+ffmpeg must be 9.0.1 (preferred) or 7.1: the versions Music Assistant ships.
 To use a particular Python, start the script with it, as in the last example.
 Safe to stop with Ctrl-C and run again: finished work is kept.
 
@@ -698,6 +699,13 @@ def main() -> None:
         subprocess.run([FFPROBE, "-version"], capture_output=True, check=True)
     except (OSError, subprocess.CalledProcessError):
         sys.exit(f"cannot run ffmpeg ({FFMPEG}) or ffprobe ({FFPROBE}); put them on PATH or use --ffmpeg / --ffprobe")
+    num = re.match(r"ffmpeg version n?(\d+)\.(\d+)(?:\.(\d+))?", ver)
+    found = tuple(int(x) for x in num.groups(default="0")) if num else None
+    if found is None or not (found == (9, 0, 1) or found[:2] == (7, 1)):
+        problem(f"this is {ver.split(' Copyright')[0] or 'an unknown ffmpeg'}; the survey accepts only ffmpeg 9.0.1 "
+                "(preferred) or 7.1, the versions Music Assistant ships. Point --ffmpeg at one of those")
+    elif found[:2] == (7, 1):
+        print("note: ffmpeg 7.1 is accepted; 9.0.1 is preferred if you have it")
     if "libsoxr" not in conf:
         problem("this ffmpeg is built without libsoxr; Music Assistant resamples with soxr, so results would differ")
     missing = [f for f in ("loudnorm", "ebur128", "astats", "aresample", "pan", "volume", "biquad", "highpass", "asplit")
