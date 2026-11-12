@@ -1,0 +1,4 @@
+{
+  "provider.tidal.config_entries.exact_stream_size.label": "Look up the exact stream size",
+  "provider.tidal.config_entries.exact_stream_size.description": "Before a track starts, ask Tidal's file servers for the size of every part of the stream and add them up, so Music Assistant knows the size of the source. This takes one small request per 4 seconds of audio the first time a track is played; the result is remembered."
+}

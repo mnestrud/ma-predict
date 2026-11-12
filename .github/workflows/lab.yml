@@ -1,0 +1,94 @@
+name: Lab
+
+# Runs the Music Assistant end-to-end test lab (virtual players in Docker) against upstream
+# dev with the patches applied. Experimental: the lab has no CI recipe of its own.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci-lab]
+
+permissions:
+  contents: read
+
+env:
+  LAB_REF: 0f53ad8a1bb282fc7605c99d1c79351ece60dc60
+  LAB_CONFIG: ${{ github.workspace }}/lab/config/lab.toml
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v7
+      - name: Check out the test lab
+        uses: actions/checkout@v7
+        with:
+          repository: music-assistant/end-to-end-test-lab
+          ref: ${{ env.LAB_REF }}
+          path: lab
+      - name: Build a server repo that holds dev, stable and the patched branch
+        run: |
+          sudo install -d -o "$USER" /srv/lab
+          mkdir -p /srv/lab/{runs,refs,golden,accounts,music/tones,cache,secrets}
+          git clone -q --bare https://github.com/music-assistant/server.git /srv/lab/upstream.git
+          git clone -q --branch dev /srv/lab/upstream.git "$RUNNER_TEMP/work"
+          patches/apply.sh "$RUNNER_TEMP/work"
+          cd "$RUNNER_TEMP/work"
+          git add -A
+          git -c user.name=ci -c user.email=ci@example.invalid commit -qm "dev + patches"
+          git push -q origin HEAD:refs/heads/patched
+          git -C /srv/lab/upstream.git log --oneline -2 patched
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install the lab
+        run: pip install -e 'lab/.[test,scenarios]'
+      - name: Write the lab config
+        run: |
+          docker pull -q ghcr.io/music-assistant/server:nightly
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' ghcr.io/music-assistant/server:nightly)
+          sed -e "s|nightly@sha256:REPLACE_ME|nightly@${digest#*@}|" \
+              -e 's|^host = .*|host = "127.0.0.1"|' \
+              -e 's|^upstream = .*|upstream = "/srv/lab/upstream.git"|' \
+              lab/config/lab.example.toml > lab/config/lab.toml
+          grep -n "nightly\|upstream\|host\|root" lab/config/lab.toml
+      - name: Build the players image and the tone library
+        working-directory: lab
+        run: |
+          docker pull -q mikebrady/shairport-sync:latest
+          docker build -q -t lab/players:latest -f images/players/Dockerfile .
+          python -m tones.generate --out /srv/lab/music/tones
+      - name: Add the Perfect FLAC scenario
+        run: cp ci/lab/test_perfect_flac.py lab/scenarios/deep/test_perfect_flac.py
+      - name: Start the lease broker
+        run: |
+          nohup labd > "$RUNNER_TEMP/labd.log" 2>&1 &
+          sleep 3
+          labctl status
+      - name: Stream area with the option off (regression)
+        working-directory: lab
+        run: labctl run --ref patched --areas streams
+      - name: Perfect FLAC on the DLNA renderer
+        working-directory: lab
+        run: labctl run --ref patched --deep --providers dlna -k perfect_flac
+      - name: Server's own verdict per stream
+        if: always()
+        run: |
+          logs=$(grep -rl "Perfect FLAC" /srv/lab/runs --include='ma.log' || true)
+          [ -n "$logs" ] || { echo "no Perfect FLAC line in any ma.log"; exit 1; }
+          grep -h "Perfect FLAC" $logs | sed 's/.*Perfect FLAC/Perfect FLAC/' | sort | uniq -c
+          ! grep -hq "Perfect FLAC: \(short\|over\)\|Perfect FLAC: passing" $logs
+      - name: Keep the run folders
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lab-runs
+          path: |
+            /srv/lab/runs/**/junit.xml
+            /srv/lab/runs/**/ma.log
+            /srv/lab/runs/**/*.json
+            ${{ runner.temp }}/labd.log
+          if-no-files-found: warn

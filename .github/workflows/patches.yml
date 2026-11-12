@@ -1,0 +1,82 @@
+name: Patches
+
+# Applies the patches in patches/ to the newest Music Assistant server (branch dev)
+# and runs their tests. A red run means upstream moved and a patch needs a refresh.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - ".github/workflows/patches.yml"
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  URLLIB3_NO_OVERRIDE: "1"
+
+jobs:
+  apply-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v7
+      - name: Check out Music Assistant server (dev)
+        uses: actions/checkout@v7
+        with:
+          repository: music-assistant/server
+          ref: dev
+          path: server
+          fetch-depth: 0
+      - name: Show versions
+        run: |
+          echo "patches made against: $(cat patches/BASE)"
+          git -C server log -1 --format='upstream dev: %h %cs %s'
+          echo "commits since: $(git -C server rev-list --count "$(cat patches/BASE)"..HEAD)"
+      - name: Apply the patches
+        run: patches/apply.sh server
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version-file: server/.python-version
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install the server and its test dependencies
+        working-directory: server
+        run: uv pip install --system --index-strategy unsafe-best-match . .[test] -r requirements_all.txt
+      - name: Lint the patched files
+        working-directory: server
+        run: |
+          files="music_assistant/helpers/perfect_flac.py music_assistant/controllers/streams/controller.py music_assistant/providers/tidal tests/core/test_perfect_flac.py tests/providers/tidal/test_streaming.py"
+          ruff check $files
+          ruff format --check $files
+          python -m scripts.build_translations --check
+      - name: Type-check the patched files
+        working-directory: server
+        run: mypy music_assistant/helpers/perfect_flac.py music_assistant/controllers/streams/controller.py music_assistant/providers/tidal
+      - name: Test
+        working-directory: server
+        run: pytest tests/core/test_perfect_flac.py tests/providers/tidal -q
+
+  image:
+    # manual only: build a patched image from the official nightly (not pushed anywhere)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: docker build -t ma-patched --build-arg BASE=ghcr.io/music-assistant/server:nightly patches/
+      - name: Check the patched code is in the image
+        run: >
+          docker run --rm --entrypoint python ma-patched -c
+          "from music_assistant.helpers.perfect_flac import CONF_PERFECT_FLAC;
+          from music_assistant.providers.tidal.constants import CONF_EXACT_STREAM_SIZE;
+          print(CONF_PERFECT_FLAC, CONF_EXACT_STREAM_SIZE)"

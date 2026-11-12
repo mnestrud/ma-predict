@@ -1,0 +1,364 @@
+diff --git a/music_assistant/providers/tidal/constants.py b/music_assistant/providers/tidal/constants.py
+index fa6837a92..75236a846 100644
+--- a/music_assistant/providers/tidal/constants.py
++++ b/music_assistant/providers/tidal/constants.py
+@@ -39,10 +39,12 @@ CONF_REFRESH_TOKEN = "refresh_token"  # noqa: S105 - config key
+ CONF_USER_ID = "user_id"
+ CONF_EXPIRY_TIME = "expiry_time"
+ CONF_QUALITY = "quality"
++CONF_EXACT_STREAM_SIZE = "exact_stream_size"
+ 
+ # Cache keys
+ CACHE_CATEGORY_RECOMMENDATIONS: Final[int] = 1
+ CACHE_CATEGORY_ISRC_MAP: Final[int] = 2
++CACHE_CATEGORY_STREAM_SIZE: Final[int] = 3
+ 
+ # Max items fetched for one page module (feed modules embed only the first page)
+ MAX_PAGE_MODULE_ITEMS: Final[int] = 50
+diff --git a/music_assistant/providers/tidal/provider.py b/music_assistant/providers/tidal/provider.py
+index 9847c0181..4d8ab304a 100644
+--- a/music_assistant/providers/tidal/provider.py
++++ b/music_assistant/providers/tidal/provider.py
+@@ -33,6 +33,7 @@ from .auth_manager import TidalAuthManager
+ from .constants import (
+     CACHE_CATEGORY_ISRC_MAP,
+     CONF_AUTH_TOKEN,
++    CONF_EXACT_STREAM_SIZE,
+     CONF_EXPIRY_TIME,
+     CONF_QUALITY,
+     CONF_REFRESH_TOKEN,
+@@ -132,6 +133,12 @@ class TidalProvider(RecommendationPayloadMixin, MusicProvider):
+                 ],
+                 default_value="HI_RES_LOSSLESS",
+             ),
++            ConfigEntry(
++                key=CONF_EXACT_STREAM_SIZE,
++                type=ConfigEntryType.BOOLEAN,
++                default_value=False,
++                advanced=True,
++            ),
+         )
+ 
+     async def handle_async_init(self) -> None:
+diff --git a/music_assistant/providers/tidal/streaming.py b/music_assistant/providers/tidal/streaming.py
+index 6c7c379fe..79d202e63 100644
+--- a/music_assistant/providers/tidal/streaming.py
++++ b/music_assistant/providers/tidal/streaming.py
+@@ -2,19 +2,21 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import base64
+ import hashlib
+ import json
+ from contextlib import suppress
+ from typing import TYPE_CHECKING, Any
+ 
+-from aiohttp import web
++import defusedxml.ElementTree as DefusedET
++from aiohttp import ClientError, ClientTimeout, web
+ from music_assistant_models.enums import ContentType, StreamType
+ from music_assistant_models.errors import MediaNotFoundError
+ from music_assistant_models.media_items import AudioFormat
+ from music_assistant_models.streamdetails import StreamDetails
+ 
+-from .constants import CONF_QUALITY
++from .constants import CACHE_CATEGORY_STREAM_SIZE, CONF_EXACT_STREAM_SIZE, CONF_QUALITY
+ 
+ if TYPE_CHECKING:
+     from .provider import TidalProvider
+@@ -31,6 +33,12 @@ _DASH_ROUTE_IDLE_BUFFER: int = 300
+ _MANIFEST_DASH = "application/dash+xml"
+ _MANIFEST_BTS = "application/vnd.tidal.bts"
+ 
++# Looking up the size of a stream: requests in flight, seconds per request, and how
++# long a size is remembered.
++_SIZE_REQUESTS_PARALLEL = 8
++_SIZE_REQUEST_TIMEOUT = 10
++_SIZE_CACHE_EXPIRATION = 30 * 86400
++
+ # ReplayGain 2.0 reference level; Tidal's replay gain values are relative to it.
+ _REPLAYGAIN_REFERENCE_LUFS = -18.0
+ 
+@@ -42,6 +50,35 @@ def _loudness_from_gain(value: float | None) -> float | None:
+     return _REPLAYGAIN_REFERENCE_LUFS - value
+ 
+ 
++def _dash_part_urls(manifest: bytes) -> list[str]:
++    """
++    Return the URL of every part (init segment, then media segments) of a DASH manifest.
++
++    An empty list means the manifest has a shape this does not read.
++
++    :param manifest: The MPD document.
++    """
++    try:
++        root = DefusedET.fromstring(manifest)
++    except DefusedET.ParseError:
++        return []
++    templates = [el for el in root.iter() if el.tag.rsplit("}", 1)[-1] == "SegmentTemplate"]
++    if len(templates) != 1:
++        return []
++    template = templates[0]
++    init, media = template.get("initialization"), template.get("media")
++    if not init or not media or "$Number$" not in media or "$Time$" in media:
++        return []
++    count = 0
++    for el in template.iter():
++        if el.tag.rsplit("}", 1)[-1] == "S":
++            count += 1 + int(el.get("r", "0"))
++    if count <= 0:
++        return []
++    start = int(template.get("startNumber", "1"))
++    return [init, *(media.replace("$Number$", str(n)) for n in range(start, start + count))]
++
++
+ class TidalStreamingManager:
+     """Manages Tidal streaming operations."""
+ 
+@@ -176,6 +213,7 @@ class TidalStreamingManager:
+             stream_type=StreamType.HTTP,
+             duration=track.duration,
+             path=url,
++            size=await self._get_stream_size(track.item_id, stream_data, url),
+             can_seek=True,
+             allow_seek=True,
+             loudness=loudness,
+@@ -203,6 +241,67 @@ class TidalStreamingManager:
+         )
+         return stream_data
+ 
++    async def _get_stream_size(
++        self, track_id: str, stream_data: dict[str, Any], url: str
++    ) -> int | None:
++        """
++        Return the size of a stream in bytes, or None when unknown or not asked for.
++
++        :param track_id: The track the stream belongs to.
++        :param stream_data: The playbackinfopostpaywall response.
++        :param url: The stream URL handed to the player pipeline.
++        """
++        if not self.provider.config.get_value(CONF_EXACT_STREAM_SIZE):
++            return None
++        if stream_data.get("manifestMimeType") == _MANIFEST_DASH and "manifest" in stream_data:
++            # a DASH stream is many small files: its size is the sum of theirs
++            part_urls = _dash_part_urls(base64.b64decode(stream_data["manifest"]))
++        else:
++            part_urls = [url]
++        if not part_urls:
++            return None
++        cache_key = (
++            f"{track_id}/{stream_data.get('audioQuality')}"
++            f"/{stream_data.get('bitDepth')}/{stream_data.get('sampleRate')}/{len(part_urls)}"
++        )
++        cached: int | None = await self.mass.cache.get(
++            cache_key, provider=self.provider.instance_id, category=CACHE_CATEGORY_STREAM_SIZE
++        )
++        if cached:
++            return cached
++        limit = asyncio.Semaphore(_SIZE_REQUESTS_PARALLEL)
++
++        async def _part_size(part_url: str) -> int | None:
++            async with (
++                limit,
++                self.mass.http_session.head(
++                    part_url,
++                    allow_redirects=True,
++                    timeout=ClientTimeout(total=_SIZE_REQUEST_TIMEOUT),
++                ) as response,
++            ):
++                if response.status != 200:
++                    return None
++                return response.content_length
++
++        try:
++            sizes = await asyncio.gather(*(_part_size(part_url) for part_url in part_urls))
++        except (ClientError, TimeoutError) as err:
++            self.provider.logger.debug("Stream size lookup failed for track %s: %s", track_id, err)
++            return None
++        if not all(sizes):
++            self.provider.logger.debug("Stream size lookup incomplete for track %s", track_id)
++            return None
++        size = sum(part for part in sizes if part)
++        await self.mass.cache.set(
++            cache_key,
++            size,
++            expiration=_SIZE_CACHE_EXPIRATION,
++            provider=self.provider.instance_id,
++            category=CACHE_CATEGORY_STREAM_SIZE,
++        )
++        return size
++
+     def _remove_dash_route(self, route_path: str) -> None:
+         """Remove a DASH manifest route from the stream server."""
+         with suppress(RuntimeError):
+diff --git a/music_assistant/providers/tidal/strings.json b/music_assistant/providers/tidal/strings.json
+index 03a36a79e..923d5ccb5 100644
+--- a/music_assistant/providers/tidal/strings.json
++++ b/music_assistant/providers/tidal/strings.json
+@@ -1,5 +1,9 @@
+ {
+   "config_entries": {
++    "exact_stream_size": {
++      "label": "Look up the exact stream size",
++      "description": "Before a track starts, ask Tidal's file servers for the size of every part of the stream and add them up, so Music Assistant knows the size of the source. This takes one small request per 4 seconds of audio the first time a track is played; the result is remembered."
++    },
+     "quality": {
+       "label": "Quality setting for Tidal:",
+       "description": "The maximum streaming quality to request from Tidal.",
+diff --git a/tests/providers/tidal/test_streaming.py b/tests/providers/tidal/test_streaming.py
+index 97fe3882e..2da3742d2 100644
+--- a/tests/providers/tidal/test_streaming.py
++++ b/tests/providers/tidal/test_streaming.py
+@@ -11,7 +11,7 @@ from music_assistant_models.enums import ContentType, StreamType
+ from music_assistant_models.errors import MediaNotFoundError
+ from music_assistant_models.media_items import Track
+ 
+-from music_assistant.providers.tidal.streaming import TidalStreamingManager
++from music_assistant.providers.tidal.streaming import TidalStreamingManager, _dash_part_urls
+ 
+ 
+ def _make_task_capturer() -> tuple[list[asyncio.Future[Any]], Mock]:
+@@ -36,7 +36,9 @@ def _bts_manifest(**fields: Any) -> str:
+ @pytest.fixture
+ def provider_mock(provider_mock: Mock) -> Mock:
+     """Return the shared provider mock with the streaming quality wired."""
+-    provider_mock.config.get_value.return_value = "HIGH"
++    values: dict[str, Any] = {"quality": "HIGH", "exact_stream_size": False}
++    provider_mock.config.get_value.side_effect = values.get
++    provider_mock.config_values = values
+     return provider_mock
+ 
+ 
+@@ -522,3 +524,130 @@ async def test_get_stream_details_playback_info_404_unresolvable(
+         await streaming_manager.get_stream_details("123")
+ 
+     assert provider_mock.api.get.call_count == 1
++
++
++_MPD = (
++    '<?xml version="1.0" encoding="UTF-8"?>'
++    '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static">'
++    '<Period id="0"><AdaptationSet id="0" contentType="audio" mimeType="audio/mp4">'
++    '<Representation id="0" codecs="flac" bandwidth="1000000" audioSamplingRate="44100">'
++    '<SegmentTemplate timescale="44100" initialization="https://cdn.example/init.mp4?t=a&amp;b=1"'
++    ' media="https://cdn.example/$Number$.mp4?t=a&amp;b=1" startNumber="1">'
++    '<SegmentTimeline><S d="176128" r="2"/><S d="1000"/></SegmentTimeline>'
++    "</SegmentTemplate></Representation></AdaptationSet></Period></MPD>"
++)
++
++
++def _dash_stream_data() -> dict[str, Any]:
++    return {
++        "manifestMimeType": "application/dash+xml",
++        "manifest": base64.b64encode(_MPD.encode()).decode(),
++        "audioQuality": "LOSSLESS",
++        "sampleRate": 44100,
++        "bitDepth": 16,
++    }
++
++
++def _wire_part_sizes(provider_mock: Mock, sizes: dict[str, int | None], status: int = 200) -> Mock:
++    """Answer HEAD requests with the given Content-Length per URL; return the head mock."""
++
++    def _head(url: str, **_kwargs: Any) -> AsyncMock:
++        response = Mock(status=status, content_length=sizes[url])
++        context = AsyncMock()
++        context.__aenter__.return_value = response
++        return context
++
++    head = Mock(side_effect=_head)
++    provider_mock.mass.http_session.head = head
++    provider_mock.mass.cache.get = AsyncMock(return_value=None)
++    provider_mock.mass.cache.set = AsyncMock()
++    return head
++
++
++def test_dash_part_urls() -> None:
++    """The init segment and every media segment of the timeline are listed."""
++    assert _dash_part_urls(_MPD.encode()) == [
++        "https://cdn.example/init.mp4?t=a&b=1",
++        "https://cdn.example/1.mp4?t=a&b=1",
++        "https://cdn.example/2.mp4?t=a&b=1",
++        "https://cdn.example/3.mp4?t=a&b=1",
++        "https://cdn.example/4.mp4?t=a&b=1",
++    ]
++    assert _dash_part_urls(b"not xml") == []
++    assert _dash_part_urls(b"<MPD/>") == []
++
++
++async def test_stream_size_off_by_default(
++    streaming_manager: TidalStreamingManager, provider_mock: Mock, mock_track: Mock
++) -> None:
++    """Without the option no size is looked up."""
++    provider_mock.get_track.return_value = mock_track
++    provider_mock.api.get.return_value = _dash_stream_data()
++    head = _wire_part_sizes(provider_mock, {})
++
++    stream_details = await streaming_manager.get_stream_details("123")
++
++    assert stream_details.size is None
++    head.assert_not_called()
++
++
++async def test_stream_size_is_sum_of_parts(
++    streaming_manager: TidalStreamingManager, provider_mock: Mock, mock_track: Mock
++) -> None:
++    """With the option on the size is the sum of the parts, and it is remembered."""
++    provider_mock.config_values["exact_stream_size"] = True
++    provider_mock.get_track.return_value = mock_track
++    provider_mock.api.get.return_value = _dash_stream_data()
++    urls = _dash_part_urls(_MPD.encode())
++    head = _wire_part_sizes(
++        provider_mock, dict(zip(urls, [623, 500000, 510000, 505000, 3000], strict=True))
++    )
++
++    stream_details = await streaming_manager.get_stream_details("123")
++
++    assert stream_details.size == 623 + 500000 + 510000 + 505000 + 3000
++    assert head.call_count == 5
++    provider_mock.mass.cache.set.assert_awaited_once()
++    assert provider_mock.mass.cache.set.await_args.args[1] == stream_details.size
++
++    provider_mock.mass.cache.get = AsyncMock(return_value=stream_details.size)
++    head.reset_mock()
++    again = await streaming_manager.get_stream_details("123")
++    assert again.size == stream_details.size
++    head.assert_not_called()
++
++
++async def test_stream_size_unknown_when_a_part_fails(
++    streaming_manager: TidalStreamingManager, provider_mock: Mock, mock_track: Mock
++) -> None:
++    """One part without a size leaves the size unknown and nothing is remembered."""
++    provider_mock.config_values["exact_stream_size"] = True
++    provider_mock.get_track.return_value = mock_track
++    provider_mock.api.get.return_value = _dash_stream_data()
++    urls = _dash_part_urls(_MPD.encode())
++    _wire_part_sizes(provider_mock, dict(zip(urls, [623, 500000, None, 505000, 3000], strict=True)))
++
++    stream_details = await streaming_manager.get_stream_details("123")
++
++    assert stream_details.size is None
++    provider_mock.mass.cache.set.assert_not_awaited()
++
++
++async def test_stream_size_of_plain_file(
++    streaming_manager: TidalStreamingManager, provider_mock: Mock, mock_track: Mock
++) -> None:
++    """A plain file URL is asked for its own size."""
++    provider_mock.config_values["exact_stream_size"] = True
++    provider_mock.get_track.return_value = mock_track
++    provider_mock.api.get.return_value = {
++        "manifestMimeType": "application/vnd.tidal.bts",
++        "urls": ["https://example.com/stream.flac"],
++        "audioQuality": "LOSSLESS",
++        "sampleRate": 44100,
++        "bitDepth": 16,
++    }
++    _wire_part_sizes(provider_mock, {"https://example.com/stream.flac": 31_000_000})
++
++    stream_details = await streaming_manager.get_stream_details("123")
++
++    assert stream_details.size == 31_000_000

@@ -1,0 +1,4 @@
+{
+  "core.streams.config_entries.perfect_flac.label": "Perfect FLAC (experimental)",
+  "core.streams.config_entries.perfect_flac.description": "For players that need a content length: announce the size of a FLAC stream from an estimate of the source, then add bytes to the stream so it ends on exactly the announced size. The audio is not changed. Applies to single tracks sent as FLAC without crossfade, where the source is a FLAC file or stream of known size. Other streams keep their usual content length."
+}

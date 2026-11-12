@@ -1,0 +1,1254 @@
+diff --git a/music_assistant/controllers/streams/controller.py b/music_assistant/controllers/streams/controller.py
+index 7524ac9af..9eb219b49 100644
+--- a/music_assistant/controllers/streams/controller.py
++++ b/music_assistant/controllers/streams/controller.py
+@@ -123,6 +123,12 @@ from music_assistant.helpers.ffmpeg import (
+     get_ffmpeg_stream,
+ )
+ from music_assistant.helpers.ffmpeg import LOGGER as FFMPEG_LOGGER
++from music_assistant.helpers.perfect_flac import (
++    CONF_PERFECT_FLAC,
++    PerfectFlacPlan,
++    PerfectFlacStream,
++    plan_perfect_flac,
++)
+ from music_assistant.helpers.throttle_retry import (
+     RequestPriority,
+     request_priority,
+@@ -651,6 +657,13 @@ class StreamsController(CoreController):
+                 required=False,
+                 requires_reload=True,
+             ),
++            ConfigEntry(
++                key=CONF_PERFECT_FLAC,
++                type=ConfigEntryType.BOOLEAN,
++                default_value=False,
++                category="generic",
++                advanced=True,
++            ),
+             ConfigEntry(
+                 key=CONF_SMART_FADES_LOG_LEVEL,
+                 type=ConfigEntryType.STRING,
+@@ -1104,6 +1117,7 @@ class StreamsController(CoreController):
+             resp = web.StreamResponse(status=200, reason="OK", headers=headers)
+             resp.content_type = get_mime_type(output_format.output_format_str)
+             http_profile = player.get_config_value(CONF_HTTP_PROFILE, "default")
++            perfect_flac_plan: PerfectFlacPlan | None = None
+             if http_profile == "forced_content_length" and not queue_item.duration:
+                 # just set an insane high content length to make sure the player keeps playing
+                 resp.content_length = calculate_content_length(output_format, 12 * 3600)
+@@ -1116,6 +1130,16 @@ class StreamsController(CoreController):
+                 resp.content_length = await get_content_length(
+                     self.mass, queue_item.uri, output_format, effective_duration
+                 )
++                if (
++                    crossfade_mode == CrossfadeMode.DISABLED
++                    and not fade_in_pending
++                    and not mix_overlay
++                ):
++                    perfect_flac_plan = await plan_perfect_flac(
++                        self.mass, player, queue_item, pcm_format, output_format, effective_duration
++                    )
++                if perfect_flac_plan:
++                    resp.content_length = perfect_flac_plan.announced
+             elif http_profile == "chunked":
+                 resp.enable_chunked_encoding()
+ 
+@@ -1211,6 +1235,10 @@ class StreamsController(CoreController):
+                     filter_params=filter_params,
+                     extra_input_args=output_pacing_args(pacing),
+                 )
++            perfect_flac: PerfectFlacStream | None = None
++            if perfect_flac_plan:
++                perfect_flac = PerfectFlacStream(audio_bytes, perfect_flac_plan, self.logger)
++                audio_bytes = perfect_flac.stream()
+             first_chunk_received = False
+             bytes_sent = 0
+             stream_completed = False
+@@ -1313,7 +1341,8 @@ class StreamsController(CoreController):
+                         self.mass,
+                         queue_item.uri,
+                         output_format,
+-                        bytes_sent,
++                        # the size before bytes were added is the one worth remembering
++                        perfect_flac.result.natural if perfect_flac else bytes_sent,
+                         queue_item.streamdetails.seconds_streamed,
+                     )
+                 )
+diff --git a/music_assistant/controllers/streams/strings.json b/music_assistant/controllers/streams/strings.json
+index 7c6b5d702..988f20bec 100644
+--- a/music_assistant/controllers/streams/strings.json
++++ b/music_assistant/controllers/streams/strings.json
+@@ -37,6 +37,10 @@
+         "hires": "Hi-res"
+       }
+     },
++    "perfect_flac": {
++      "label": "Perfect FLAC (experimental)",
++      "description": "For players that need a content length: announce the size of a FLAC stream from an estimate of the source, then add bytes to the stream so it ends on exactly the announced size. The audio is not changed. Applies to single tracks sent as FLAC without crossfade, where the source is a FLAC file or stream of known size. Other streams keep their usual content length."
++    },
+     "smart_fades_log_level": {
+       "label": "Smart Fades Log level",
+       "description": "Log level for the Smart Fades mixer and analyzer."
+diff --git a/music_assistant/helpers/perfect_flac.py b/music_assistant/helpers/perfect_flac.py
+new file mode 100644
+index 000000000..8c422fa9f
+--- /dev/null
++++ b/music_assistant/helpers/perfect_flac.py
+@@ -0,0 +1,932 @@
++"""
++Perfect FLAC: make a FLAC stream end on exactly the announced Content-Length.
++
++Experimental. Two parts:
++
++- ``estimate_flac_size``: the size to announce for a FLAC stream, from the size of a
++  FLAC source (model "V2") plus a margin, so the real stream is rarely larger.
++- ``PerfectFlacStream``: wraps the encoded stream. Frames pass through unchanged, except
++  where bytes have to be added to reach the announced size: those frames are stored again
++  with wider sample fields than needed. No sample is added, removed or changed.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import math
++from collections import deque
++from dataclasses import dataclass, field
++from typing import TYPE_CHECKING, Any, Final
++
++import numpy as np
++
++if TYPE_CHECKING:
++    import logging
++    from collections.abc import AsyncGenerator, Callable
++
++    from music_assistant_models.media_items import AudioFormat
++    from music_assistant_models.queue_item import QueueItem
++
++    from music_assistant.mass import MusicAssistant
++    from music_assistant.models.player import Player
++
++CONF_PERFECT_FLAC: Final[str] = "perfect_flac"
++
++# model V2 (frozen 2026-11-12), offsets in bits per sample
++V2_OFFSET_BITS: Final[float] = 0.57
++V2_OFFSET_PADDED_BITS: Final[float] = 0.77
++V2_RESAMPLE_C: Final[float] = 2.6
++V2_MONO_DITHER_BITS: Final[float] = 1.65
++V2_PADDED_GUARD_BITS: Final[float] = 13.0
++
++# announced on top of the estimate, so the real stream is rarely the larger one
++MARGIN_MODEL: Final[float] = 0.15
++# announced on top of a size measured on an earlier play of the same item
++MARGIN_MEASURED: Final[float] = 0.02
++MARGIN_MEASURED_BYTES: Final[int] = 65536
++
++# seconds of encoded audio held back to land on the exact byte at the end
++WINDOW_SECONDS: Final[float] = 6.0
++# share of what the window can fill that the stream is steered to leave for the end
++RESERVE_SHARE: Final[float] = 0.6
++WINDOW_MAX_SECONDS: Final[float] = 30.0
++STEER_CAUTION: Final[float] = 0.08
++STEER_AFTER_SECONDS: Final[float] = 10.0
++DECODER_WAIT_SECONDS: Final[float] = 3.0
++MAX_FIELD_BITS: Final[int] = 31
++MAX_PARTITION_ORDER: Final[int] = 8
++MIN_PARTITION_ORDER: Final[int] = 4
++CRC16_PERIOD: Final[int] = 32767
++
++
++def get_regime(
++    *,
++    float_stage: bool,
++    samples_changed: bool,
++    dynamic_normalization: bool,
++    pcm_bit_depth: int,
++    output_bit_depth: int,
++) -> str:
++    """
++    Return the V2 regime (R0-R4) of an output stream.
++
++    :param float_stage: Whether the internal PCM is floating point.
++    :param samples_changed: Whether gain, DSP, resampling or channel mixing changes samples.
++    :param dynamic_normalization: Whether dynamic loudness normalization runs.
++    :param pcm_bit_depth: Bit depth of the internal PCM.
++    :param output_bit_depth: Bit depth of the encoded stream.
++    """
++    if dynamic_normalization:
++        return "R4"
++    if not float_stage:
++        if samples_changed:
++            return "R2" if output_bit_depth > 16 else "R3"
++        return "R3" if (pcm_bit_depth > 16 and output_bit_depth == 16) else "R0"
++    if output_bit_depth == 16:
++        return "R3"
++    return "R2" if samples_changed else "R1"
++
++
++def estimate_flac_ratio(  # noqa: PLR0913
++    *,
++    source_size: int | None,
++    source_is_flac: bool,
++    source_rate: int,
++    source_bit_depth: int,
++    source_channels: int,
++    output_rate: int,
++    output_bit_depth: int,
++    output_channels: int,
++    duration: float,
++    regime: str,
++    gain_db: float = 0.0,
++) -> float | None:
++    """
++    Return the V2 ratio of encoded size to PCM size, or None where V2 does not apply.
++
++    :param source_size: Size of the source file or stream in bytes, if known.
++    :param source_is_flac: Whether the source is FLAC.
++    :param source_rate: Sample rate of the source.
++    :param source_bit_depth: Bit depth of the source.
++    :param source_channels: Channel count of the source.
++    :param output_rate: Sample rate of the encoded stream.
++    :param output_bit_depth: Bit depth of the encoded stream.
++    :param output_channels: Channel count of the encoded stream.
++    :param duration: Full duration of the source in seconds.
++    :param regime: Regime from ``get_regime``.
++    :param gain_db: Total fixed gain applied to the samples in dB.
++    """
++    if not source_is_flac or not source_size or duration < 1:
++        return None
++    seconds = int(duration) + 0.5
++    bits = (
++        source_size
++        / (source_rate * source_bit_depth / 8 * source_channels * seconds)
++        * source_bit_depth
++    )
++    gain = gain_db / 6.02
++    if regime == "R4":
++        if output_bit_depth <= 16:
++            return None
++        regime, gain = "R2", 0.0
++    if source_bit_depth > 16 and bits < V2_PADDED_GUARD_BITS and regime in ("R2", "R3"):
++        return None
++    offset = V2_OFFSET_BITS
++    if regime == "R1" and output_bit_depth > source_bit_depth:
++        offset = V2_OFFSET_PADDED_BITS
++    elif regime == "R2":
++        bits += max(output_bit_depth - source_bit_depth, 0) + gain
++    elif regime == "R3":
++        bits += -max(source_bit_depth - 16, 0) + gain
++    if output_rate < source_rate:
++        bits += V2_RESAMPLE_C * math.log2(source_rate / output_rate)
++    bits = (bits + offset) * source_channels / output_channels
++    if regime == "R3" and source_channels == 1 and output_channels == 2:
++        bits += V2_MONO_DITHER_BITS
++    return min(max(bits / output_bit_depth, 0.02), 1.01)
++
++
++def estimate_flac_size(
++    *,
++    ratio: float,
++    output_rate: int,
++    output_bit_depth: int,
++    output_channels: int,
++    seconds: float,
++) -> tuple[int, int]:
++    """
++    Return (size to announce, estimate without margin) in bytes for a FLAC stream.
++
++    :param ratio: Ratio from ``estimate_flac_ratio``.
++    :param output_rate: Sample rate of the encoded stream.
++    :param output_bit_depth: Bit depth of the encoded stream.
++    :param output_channels: Channel count of the encoded stream.
++    :param seconds: Seconds of audio the stream will carry.
++    """
++    pcm_rate = output_rate * output_bit_depth / 8 * output_channels
++    estimate = int(ratio * pcm_rate * (int(seconds) + 0.5))
++    return int(estimate * (1 + MARGIN_MODEL)), estimate
++
++
++def announce_measured_size(measured: int) -> int:
++    """Return the size to announce when an earlier play of the same item was measured."""
++    return int(measured * (1 + MARGIN_MEASURED)) + MARGIN_MEASURED_BYTES
++
++
++async def plan_perfect_flac(
++    mass: MusicAssistant,
++    player: Player,
++    queue_item: QueueItem,
++    pcm_format: AudioFormat,
++    output_format: AudioFormat,
++    seconds: float,
++) -> PerfectFlacPlan | None:
++    """
++    Return the sizes for a single track stream, or None.
++
++    None means Perfect FLAC does not apply: the option is off, the stream is not a plain
++    FLAC stream of one track, or the source gives no size estimate (not FLAC, size unknown).
++
++    :param mass: The MusicAssistant instance.
++    :param player: The player the stream is for.
++    :param queue_item: The queue item being streamed.
++    :param pcm_format: Format of the internal PCM.
++    :param output_format: Format of the encoded stream.
++    :param seconds: Seconds of audio the stream will carry.
++    """
++    from music_assistant_models.enums import (  # noqa: PLC0415
++        ContentType,
++        MediaType,
++        VolumeNormalizationMode,
++    )
++
++    from music_assistant.constants import (  # noqa: PLC0415
++        CONF_VOLUME_NORMALIZATION_FIXED_GAIN_TRACKS,
++    )
++    from music_assistant.helpers.audio import (  # noqa: PLC0415
++        CONTENT_LENGTH_CACHE_CATEGORY,
++        CONTENT_LENGTH_CACHE_PROVIDER,
++        get_output_format_key,
++    )
++
++    streamdetails = queue_item.streamdetails
++    if (
++        streamdetails is None
++        or not mass.streams.get_config_value(CONF_PERFECT_FLAC, return_type=bool)
++        or output_format.content_type != ContentType.FLAC
++        or output_format.bit_depth not in (16, 24)
++        or queue_item.media_type != MediaType.TRACK
++        or streamdetails.is_realtime
++        or queue_item.extra_attributes.get("playback_speed", 1.0) != 1.0
++    ):
++        return None
++    source = streamdetails.audio_format
++    mode = streamdetails.volume_normalization_mode
++    gain = 0.0
++    if mode == VolumeNormalizationMode.FIXED_GAIN:
++        gain = mass.streams.get_config_value(
++            CONF_VOLUME_NORMALIZATION_FIXED_GAIN_TRACKS, return_type=float
++        )
++    elif mode == VolumeNormalizationMode.MEASUREMENT_ONLY:
++        target = float(streamdetails.target_loudness or 0.0)
++        if streamdetails.prefer_album_loudness and streamdetails.loudness_album is not None:
++            gain = target - float(streamdetails.loudness_album)
++        elif streamdetails.loudness is not None:
++            gain = target - float(streamdetails.loudness)
++    output_plan = mass.streams.audio.get_player_output_plan(
++        player_id=player.player_id,
++        input_format=pcm_format,
++        output_format=output_format,
++        shared_player_ids=player.state.group_members,
++    )
++    dsp = output_plan.output_details.dsp
++    dsp_gain = dsp.input_gain + dsp.output_gain
++    dsp_gain += sum(float(getattr(item, "gain", 0.0)) for item in dsp.filters)
++    samples_changed = (
++        round(gain, 2) != 0
++        or bool(output_plan.filter_params)
++        or output_format.sample_rate != source.sample_rate
++        or source.channels > 2
++    )
++    ratio = estimate_flac_ratio(
++        source_size=streamdetails.size,
++        source_is_flac=source.content_type == ContentType.FLAC,
++        source_rate=source.sample_rate,
++        source_bit_depth=source.bit_depth,
++        source_channels=source.channels,
++        output_rate=output_format.sample_rate,
++        output_bit_depth=output_format.bit_depth,
++        output_channels=output_format.channels,
++        duration=float(streamdetails.duration or queue_item.duration or 0),
++        regime=get_regime(
++            float_stage=pcm_format.content_type in (ContentType.PCM_F32LE, ContentType.PCM_F64LE),
++            samples_changed=samples_changed,
++            dynamic_normalization=mode == VolumeNormalizationMode.DYNAMIC,
++            pcm_bit_depth=pcm_format.bit_depth,
++            output_bit_depth=output_format.bit_depth,
++        ),
++        gain_db=gain + dsp_gain,
++    )
++    if ratio is None:
++        # no estimate from the source: the stream keeps its stock content length
++        return None
++    cached: dict[str, float] | None = await mass.cache.get(
++        f"{queue_item.uri}/{get_output_format_key(output_format)}",
++        provider=CONTENT_LENGTH_CACHE_PROVIDER,
++        category=CONTENT_LENGTH_CACHE_CATEGORY,
++    )
++    if cached is not None and abs(seconds - cached["duration"]) < 1:
++        measured = int(cached["size"])
++        return PerfectFlacPlan(announce_measured_size(measured), measured, seconds)
++    announced, expected = estimate_flac_size(
++        ratio=ratio,
++        output_rate=output_format.sample_rate,
++        output_bit_depth=output_format.bit_depth,
++        output_channels=output_format.channels,
++        seconds=seconds,
++    )
++    return PerfectFlacPlan(announced, expected, seconds)
++
++
++@dataclass(slots=True)
++class PerfectFlacPlan:
++    """Sizes of one stream, decided before the response headers are sent."""
++
++    announced: int
++    expected: int
++    seconds: float
++
++
++@dataclass(slots=True)
++class PerfectFlacResult:
++    """Outcome of one stream."""
++
++    announced: int
++    natural: int = 0
++    sent: int = 0
++    padded_frames: int = 0
++    frames: int = 0
++    status: str = "open"
++
++
++@dataclass(slots=True)
++class _Frame:
++    data: bytes
++    number: int
++    blocksize: int
++    header_len: int
++
++
++@dataclass(slots=True)
++class _Plan:
++    """How one frame can be stored larger: field widths per partition and the size range."""
++
++    header: bytes
++    samples: np.ndarray
++    orders: list[int]
++    widths: list[np.ndarray]
++    residuals: list[np.ndarray]
++    partition_len: int
++    base_bits: int
++    min_bytes: int
++    max_bytes: int
++    bit_depth: int
++    porder: int = field(default=0)
++
++
++class PerfectFlacStream:
++    """Pass a FLAC stream through and add bytes so it ends on exactly ``target_size``."""
++
++    def __init__(
++        self,
++        audio_bytes: AsyncGenerator[bytes],
++        plan: PerfectFlacPlan,
++        logger: logging.Logger,
++        decoder: Callable[[AsyncGenerator[bytes], int, int, int], AsyncGenerator[bytes]]
++        | None = None,
++    ) -> None:
++        """
++        Initialize.
++
++        :param audio_bytes: The encoded FLAC stream.
++        :param plan: The announced size, the expected size and the expected seconds.
++        :param logger: Logger for the outcome.
++        :param decoder: Returns PCM (s16le for 16-bit, else s32le) for a FLAC stream, given
++            the stream, sample rate, bit depth and channels. Defaults to ffmpeg.
++        """
++        self.result = PerfectFlacResult(announced=plan.announced)
++        self._source = audio_bytes
++        self._target = plan.announced
++        self._expected_seconds = plan.seconds
++        self._expected_size = plan.expected
++        self._logger = logger
++        self._decoder = decoder or _ffmpeg_decoder
++        self._buf = bytearray()
++        self._scan_pos = 0
++        self._queue: deque[_Frame] = deque()
++        self._queued_bytes = 0
++        self._frame_bytes = 0
++        self._passthrough = False
++        self._carry = 0.0
++        self._decoder_usable = True
++        self._rate = 0
++        self._bit_depth = 0
++        self._channels = 0
++        self._blocksize = 4096
++        self._window = 64
++        self._pcm = bytearray()
++        self._pcm_base = 0
++        self._decoder_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
++        self._decoder_task: asyncio.Task[None] | None = None
++
++    async def stream(self) -> AsyncGenerator[bytes]:  # noqa: PLR0915
++        """Yield the stream, ending on the announced size where that is possible."""
++        result = self.result
++        try:
++            async for chunk in self._source:
++                result.natural += len(chunk)
++                if self._passthrough:
++                    result.sent += len(chunk)
++                    yield chunk
++                    continue
++                self._buf += chunk
++                self._decoder_queue.put_nowait(chunk)
++                if not self._rate:
++                    header = self._take_stream_header()
++                    if header is None:
++                        continue
++                    result.sent += len(header)
++                    yield header
++                    if self._gave_up():
++                        continue
++                    self._decoder_task = asyncio.create_task(self._decode())
++                self._take_frames()
++                if self._gave_up():
++                    held = bytes(self._buf)
++                    self._buf.clear()
++                    result.sent += len(held)
++                    yield held
++                    continue
++                while len(self._queue) > self._window:
++                    data = await self._steer(self._pop())
++                    result.sent += len(data)
++                    yield data
++            if self._gave_up() or not self._rate:
++                rest = bytes(self._buf)
++                self._buf.clear()
++                if rest:
++                    result.sent += len(rest)
++                    yield rest
++            else:
++                self._take_frames(final=True)
++                self._decoder_queue.put_nowait(None)
++                if self._decoder_task:
++                    try:
++                        await asyncio.wait_for(self._decoder_task, 15)
++                    except (TimeoutError, Exception) as err:
++                        self._logger.warning("Perfect FLAC: decoder failed: %s", err)
++                for data in await asyncio.to_thread(self._land):
++                    result.sent += len(data)
++                    yield data
++            if result.sent == self._target:
++                result.status = "exact"
++            elif result.sent < self._target:
++                result.status = "short"
++            else:
++                result.status = "over"
++            self._logger.log(
++                10 if result.status == "exact" else 30,
++                "Perfect FLAC: %s - announced %d, sent %d, unpadded %d, "
++                "%d of %d frames stored larger",
++                result.status,
++                self._target,
++                result.sent,
++                result.natural,
++                result.padded_frames,
++                result.frames,
++            )
++        finally:
++            if self._decoder_task and not self._decoder_task.done():
++                self._decoder_task.cancel()
++            await self._source.aclose()
++
++    async def _decode(self) -> None:
++        async def _input() -> AsyncGenerator[bytes]:
++            while (chunk := await self._decoder_queue.get()) is not None:
++                yield chunk
++
++        async for pcm in self._decoder(_input(), self._rate, self._bit_depth, self._channels):
++            self._pcm += pcm
++
++    async def _wait_for_samples(self, frame: _Frame) -> None:
++        """Wait until the decoder has delivered the samples of a frame, within limits."""
++        width = 2 if self._bit_depth == 16 else 4
++        end = (frame.number + 1) * self._blocksize * self._channels * width
++        waited = 0.0
++        while (
++            self._decoder_usable
++            and self._decoder_task
++            and not self._decoder_task.done()
++            and self._pcm_base + len(self._pcm) < end
++        ):
++            if waited >= DECODER_WAIT_SECONDS:
++                self._decoder_usable = False
++                self._logger.warning("Perfect FLAC: decoder too slow, padding at the end only")
++                break
++            await asyncio.sleep(0.01)
++            waited += 0.01
++
++    def _take_stream_header(self) -> bytes | None:
++        """Return the metadata blocks once they are complete; set the stream parameters."""
++        buf = self._buf
++        if len(buf) < 4:
++            return None
++        if buf[:4] != b"fLaC":
++            self._passthrough = True
++            self._rate = 1
++            data = bytes(buf)
++            buf.clear()
++            return data
++        pos = 4
++        info: bytes | None = None
++        while True:
++            if len(buf) < pos + 4:
++                return None
++            length = int.from_bytes(buf[pos + 1 : pos + 4], "big")
++            if len(buf) < pos + 4 + length:
++                return None
++            if buf[pos] & 0x7F == 0:
++                info = bytes(buf[pos + 4 : pos + 4 + length])
++            last = buf[pos] & 0x80
++            pos += 4 + length
++            if last:
++                break
++        data = bytes(buf[:pos])
++        del buf[:pos]
++        if info is None or len(info) < 18:
++            self._passthrough = True
++            self._rate = 1
++            return data
++        self._blocksize = int.from_bytes(info[2:4], "big")
++        self._rate = (info[10] << 12) | (info[11] << 4) | (info[12] >> 4)
++        self._channels = ((info[12] >> 1) & 7) + 1
++        self._bit_depth = (((info[12] & 1) << 4) | (info[13] >> 4)) + 1
++        fixed = int.from_bytes(info[0:2], "big") == self._blocksize
++        if not fixed or self._channels > 2 or self._bit_depth not in (16, 24):
++            self._passthrough = True
++            return data
++        # hold back enough frames to fill the expected gap at the end, within limits
++        frames = max(self._expected_seconds * self._rate / self._blocksize, 1)
++        frame_room = self._blocksize * self._channels * MAX_FIELD_BITS / 8 - (
++            self._expected_size / frames
++        )
++        wanted = (self._target - self._expected_size) / max(RESERVE_SHARE * frame_room, 1)
++        per_second = self._rate / self._blocksize
++        self._window = int(
++            min(max(wanted, WINDOW_SECONDS * per_second), WINDOW_MAX_SECONDS * per_second)
++        )
++        return data
++
++    def _take_frames(self, final: bool = False) -> None:
++        """Move complete frames from the buffer to the queue."""
++        buf = self._buf
++        while True:
++            if len(buf) < 16:
++                break
++            head = _parse_frame_header(buf, 0)
++            if head is None:
++                self._give_up("unexpected data where a frame should start")
++                return
++            number, blocksize, header_len = head
++            pos = max(self._scan_pos, header_len)
++            end = -1
++            while True:
++                pos = buf.find(b"\xff\xf8", pos)
++                if pos < 0 or len(buf) < pos + 16:
++                    break
++                nxt = _parse_frame_header(buf, pos)
++                if nxt is not None and nxt[0] == number + 1:
++                    end = pos
++                    break
++                pos += 1
++            if end < 0:
++                self._scan_pos = max(len(buf) - 16, header_len) if pos < 0 else pos
++                break
++            self._push(_Frame(bytes(buf[:end]), number, blocksize, header_len))
++            del buf[:end]
++            self._scan_pos = 0
++        if final and buf:
++            head = _parse_frame_header(buf, 0) if len(buf) >= 6 else None
++            if head is None:
++                self._give_up("unexpected data at the end")
++                return
++            self._push(_Frame(bytes(buf), head[0], head[1], head[2]))
++            buf.clear()
++
++    def _push(self, frame: _Frame) -> None:
++        self._queue.append(frame)
++        self._queued_bytes += len(frame.data)
++        self._frame_bytes += len(frame.data)
++        self.result.frames += 1
++
++    def _pop(self) -> _Frame:
++        frame = self._queue.popleft()
++        self._queued_bytes -= len(frame.data)
++        return frame
++
++    def _gave_up(self) -> bool:
++        return self._passthrough
++
++    def _give_up(self, reason: str) -> None:
++        """Stop touching the stream: everything held goes out unchanged."""
++        self._logger.warning("Perfect FLAC: passing the stream through unchanged: %s", reason)
++        self._passthrough = True
++        held = b"".join(frame.data for frame in self._queue) + bytes(self._buf)
++        self._queue.clear()
++        self._queued_bytes = 0
++        self._buf = bytearray(held)
++
++    def _samples(self, frame: _Frame) -> np.ndarray | None:
++        """Return the decoded samples of a frame (rows: samples, columns: channels)."""
++        width = 2 if self._bit_depth == 16 else 4
++        start = frame.number * self._blocksize * self._channels * width - self._pcm_base
++        size = frame.blocksize * self._channels * width
++        if start < 0 or len(self._pcm) < start + size:
++            return None
++        raw = np.frombuffer(
++            bytes(self._pcm[start : start + size]), dtype="<i2" if width == 2 else "<i4"
++        )
++        samples = raw.astype(np.int64).reshape(-1, self._channels)
++        if width == 4:
++            samples >>= 32 - self._bit_depth
++        return samples
++
++    def _drop_pcm(self, frame: _Frame) -> None:
++        width = 2 if self._bit_depth == 16 else 4
++        end = (frame.number + 1) * self._blocksize * self._channels * width - self._pcm_base
++        if 0 < end <= len(self._pcm):
++            del self._pcm[:end]
++            self._pcm_base += end
++
++    def _plan(self, frame: _Frame) -> _Plan | None:
++        if frame.blocksize != self._blocksize:
++            return None
++        samples = self._samples(frame)
++        if samples is None:
++            return None
++        return _plan_frame(frame, samples, self._bit_depth)
++
++    async def _steer(self, frame: _Frame) -> bytes:
++        """
++        Return the oldest held frame, stored larger when the stream is heading for a gap.
++
++        The gap at the end is projected from the bytes per sample so far. Whatever exceeds
++        what the held-back window can fill is spread over the frames still to come.
++        """
++        expected = int(self._expected_seconds * self._rate)
++        seen = (self._queue[-1].number + 1) * self._blocksize if self._queue else 0
++        data = frame.data
++        if seen:
++            per_sample = self._frame_bytes / seen
++            # count on the rest of the track being larger than what came so far, so that
++            # bytes are not added early to a stream that turns out not to need them
++            natural_left = (
++                self._queued_bytes
++                + len(data)
++                + per_sample * max(expected - seen, 0) * (1 + STEER_CAUTION)
++            )
++            gap = self._target - self.result.sent - natural_left
++            frame_room = self._blocksize * self._channels * MAX_FIELD_BITS / 8 - per_sample * (
++                self._blocksize
++            )
++            reserve = RESERVE_SHARE * self._window * max(frame_room, 0)
++            excess = gap - reserve
++            if excess > 0 and seen > STEER_AFTER_SECONDS * self._rate:
++                frames_left = max((expected - frame.number * self._blocksize) / self._blocksize, 1)
++                # a frame cannot grow by less than a few kB, so the share of the frames
++                # that are left as they are is carried over to the next one that grows
++                self._carry += excess / frames_left
++                await self._wait_for_samples(frame)
++                plan = self._plan(frame)
++                if plan is not None and len(data) + self._carry >= plan.min_bytes:
++                    size = min(len(data) + int(self._carry), plan.max_bytes)
++                    packed = await asyncio.to_thread(_store_frame, plan, size)
++                    if packed is not None:
++                        self._carry -= len(packed) - len(data)
++                        data = packed
++                        self.result.padded_frames += 1
++            else:
++                self._carry = 0.0
++        self._drop_pcm(frame)
++        return data
++
++    def _land(self) -> list[bytes]:
++        """Return the held frames, stored so that the stream ends on the announced byte."""
++        frames = list(self._queue)
++        self._queue.clear()
++        out = [frame.data for frame in frames]
++        gap = self._target - self.result.sent - sum(len(data) for data in out)
++        if gap <= 0:
++            return out
++        plans = [(i, plan) for i, frame in enumerate(frames) if (plan := self._plan(frame))]
++        # use as many frames as the gap allows, so no single frame grows more than needed
++        plans.sort(key=lambda item: item[1].min_bytes - len(out[item[0]]))
++        chosen: list[tuple[int, _Plan]] = []
++        needed = 0
++        for i, plan in plans:
++            grow = plan.min_bytes - len(out[i])
++            if needed + grow > gap:
++                break
++            needed += grow
++            chosen.append((i, plan))
++        chosen.sort(key=lambda item: item[0])
++        for n, (i, plan) in enumerate(chosen):
++            rest = chosen[n + 1 :]
++            rest_min = sum(p.min_bytes - len(out[j]) for j, p in rest)
++            rest_room = sum(p.max_bytes - p.min_bytes for _, p in rest)
++            room = plan.max_bytes - plan.min_bytes
++            spare = gap - rest_min - (plan.min_bytes - len(out[i]))
++            share = spare if not rest else spare * room // max(room + rest_room, 1)
++            size = plan.min_bytes + max(0, min(share, room))
++            packed = _store_frame(plan, size)
++            if packed is None:
++                continue
++            gap -= len(packed) - len(out[i])
++            out[i] = packed
++            self.result.padded_frames += 1
++        return out
++
++
++async def _ffmpeg_decoder(
++    audio_input: AsyncGenerator[bytes], rate: int, bit_depth: int, channels: int
++) -> AsyncGenerator[bytes]:
++    """Decode a FLAC stream to PCM with ffmpeg."""
++    from music_assistant_models.enums import ContentType  # noqa: PLC0415
++    from music_assistant_models.media_items import AudioFormat  # noqa: PLC0415
++
++    from music_assistant.helpers.ffmpeg import get_ffmpeg_stream  # noqa: PLC0415
++
++    pcm_type = ContentType.PCM_S16LE if bit_depth == 16 else ContentType.PCM_S32LE
++    async for chunk in get_ffmpeg_stream(
++        audio_input=audio_input,
++        input_format=AudioFormat(
++            content_type=ContentType.FLAC, sample_rate=rate, bit_depth=bit_depth, channels=channels
++        ),
++        output_format=AudioFormat(
++            content_type=pcm_type,
++            sample_rate=rate,
++            bit_depth=16 if bit_depth == 16 else 32,
++            channels=channels,
++        ),
++    ):
++        yield chunk
++
++
++def _parse_frame_header(buf: bytes | bytearray, pos: int) -> tuple[int, int, int] | None:
++    """Return (frame number, blocksize, header length) for a valid fixed-blocksize header."""
++    if len(buf) < pos + 6 or buf[pos] != 0xFF or buf[pos + 1] != 0xF8 or buf[pos + 3] & 1:
++        return None
++    size_code, rate_code = buf[pos + 2] >> 4, buf[pos + 2] & 15
++    if size_code == 0 or rate_code == 15:
++        return None
++    lead = buf[pos + 4]
++    if lead < 0x80:
++        extra, number = 0, lead
++    elif lead >= 0xFE or lead < 0xC0:
++        return None
++    else:
++        extra = 1
++        while lead & (0x40 >> extra):
++            extra += 1
++        number = lead & (0x3F >> extra)
++    cur = pos + 5
++    if len(buf) < cur + extra + 5:
++        return None
++    for _ in range(extra):
++        if buf[cur] & 0xC0 != 0x80:
++            return None
++        number = (number << 6) | (buf[cur] & 0x3F)
++        cur += 1
++    if size_code == 1:
++        blocksize = 192
++    elif size_code <= 5:
++        blocksize = 576 << (size_code - 2)
++    elif size_code == 6:
++        blocksize = buf[cur] + 1
++        cur += 1
++    elif size_code == 7:
++        blocksize = int.from_bytes(buf[cur : cur + 2], "big") + 1
++        cur += 2
++    else:
++        blocksize = 256 << (size_code - 8)
++    if rate_code == 12:
++        cur += 1
++    elif rate_code in (13, 14):
++        cur += 2
++    if len(buf) <= cur or _crc8(buf[pos:cur]) != buf[cur]:
++        return None
++    return number, blocksize, cur + 1 - pos
++
++
++def _plan_frame(frame: _Frame, samples: np.ndarray, bit_depth: int) -> _Plan | None:
++    """Work out how a frame can be stored with uncompressed residual partitions."""
++    blocksize, channels = samples.shape
++    porder = min(MAX_PARTITION_ORDER, (blocksize & -blocksize).bit_length() - 1)
++    if porder < MIN_PARTITION_ORDER:
++        return None
++    partitions = 1 << porder
++    plen = blocksize >> porder
++    orders: list[int] = []
++    widths: list[np.ndarray] = []
++    residuals: list[np.ndarray] = []
++    bits = 0
++    room = 0
++    for ch in range(channels):
++        best: tuple[int, int, np.ndarray, np.ndarray] | None = None
++        for order in (1, 2):
++            res = np.zeros(blocksize, dtype=np.int64)
++            res[order:] = np.diff(samples[:, ch], n=order)
++            parts = res.reshape(partitions, plen)
++            magnitude = (parts ^ (parts >> 63)).max(axis=1)
++            width = np.frexp(magnitude.astype(np.float64))[1].astype(np.int64) + 1
++            width[~parts.any(axis=1)] = 0
++            lengths = np.full(partitions, plen, dtype=np.int64)
++            lengths[0] -= order
++            cost = int((width * lengths).sum()) + order * bit_depth
++            if best is None or cost < best[0]:
++                best = (cost, order, width, parts)
++        assert best is not None
++        cost, order, width, parts = best
++        if int(width.max()) > MAX_FIELD_BITS:
++            return None
++        orders.append(order)
++        widths.append(width)
++        residuals.append(parts)
++        bits += 8 + 6 + partitions * 9 + cost
++        room += int((MAX_FIELD_BITS - width[1:]).sum()) * plen
++    header = bytearray(frame.data[: frame.header_len])
++    header[3] = ((channels - 1) << 4) | (header[3] & 0x0F)
++    header[-1] = _crc8(header[:-1])
++    fixed = len(header) + 2
++    return _Plan(
++        header=bytes(header),
++        samples=samples,
++        orders=orders,
++        widths=widths,
++        residuals=residuals,
++        partition_len=plen,
++        base_bits=bits,
++        # the first partition of each channel is kept for the last few bits
++        min_bytes=fixed + (bits + 7) // 8 + 2 * plen * channels,
++        max_bytes=fixed + (bits + room) // 8 - 2 * plen * channels,
++        bit_depth=bit_depth,
++        porder=porder,
++    )
++
++
++def _store_frame(plan: _Plan, size: int) -> bytes | None:
++    """Return the frame stored in exactly ``size`` bytes, or None where that is not possible."""
++    if not plan.min_bytes <= size <= plan.max_bytes:
++        return None
++    plen = plan.partition_len
++    top = 8 * (size - len(plan.header) - 2) - plan.base_bits
++    first_steps = [plen - order for order in plan.orders]
++    first_room = [min(MAX_FIELD_BITS - int(w[0]), plen) for w in plan.widths]
++    rest_room = [MAX_FIELD_BITS - w[1:] for w in plan.widths]
++    total_rest = sum(int(r.sum()) for r in rest_room)
++    solution: tuple[list[int], int] | None = None
++    for extra in range(top, top - 8, -1):
++        for first in _first_partition_choices(first_room):
++            left = extra - sum(n * step for n, step in zip(first, first_steps, strict=True))
++            if left >= 0 and left % plen == 0 and left // plen <= total_rest:
++                solution = (first, left // plen)
++                break
++        if solution:
++            break
++    if solution is None:
++        return None
++    first, steps = solution
++    # raise every other partition to a common level, as far as its field allows
++    flat = np.concatenate(rest_room)
++    level = 0
++    while int(np.minimum(flat, level + 1).sum()) <= steps and level < MAX_FIELD_BITS:
++        level += 1
++    add = np.minimum(flat, level)
++    short = steps - int(add.sum())
++    if short:
++        add[np.flatnonzero(flat > level)[:short]] += 1
++    values: list[np.ndarray] = []
++    sizes: list[np.ndarray] = []
++    pos = 0
++    for ch, order in enumerate(plan.orders):
++        width = plan.widths[ch].copy()
++        width[0] += first[ch]
++        count = len(width) - 1
++        width[1:] += add[pos : pos + count]
++        pos += count
++        warm = plan.samples[:order, ch] & ((1 << plan.bit_depth) - 1)
++        values.append(np.array([(0b001000 | order) << 1], dtype=np.int64))
++        sizes.append(np.array([8], dtype=np.int64))
++        values.append(warm)
++        sizes.append(np.full(order, plan.bit_depth, dtype=np.int64))
++        values.append(np.array([plan.porder], dtype=np.int64))
++        sizes.append(np.array([6], dtype=np.int64))
++        parts = plan.residuals[ch]
++        field_sizes = np.repeat(width[:, None], plen, axis=1)
++        field_sizes[0, :order] = 0
++        fields = parts & ((np.int64(1) << field_sizes) - 1)
++        values.append(np.concatenate([(0b1111 << 5) | width[:, None], fields], axis=1).ravel())
++        sizes.append(
++            np.concatenate(
++                [np.full((len(width), 1), 9, dtype=np.int64), field_sizes], axis=1
++            ).ravel()
++        )
++    body = _pack_bits(np.concatenate(values), np.concatenate(sizes))
++    frame = np.concatenate([np.frombuffer(plan.header, dtype=np.uint8), body])
++    data = frame.tobytes() + int(_crc16(frame)).to_bytes(2, "big")
++    return data if len(data) == size else None
++
++
++def _first_partition_choices(room: list[int]) -> list[list[int]]:
++    """Return every combination of extra bits for the first partition of each channel."""
++    choices: list[list[int]] = [[]]
++    for limit in room:
++        choices = [[*choice, n] for choice in choices for n in range(limit + 1)]
++    return choices
++
++
++def _pack_bits(values: np.ndarray, sizes: np.ndarray) -> np.ndarray:
++    """Pack fields of up to 32 bits, most significant bit first, padded to whole bytes."""
++    aligned = (values << (32 - sizes)).astype(">u4")
++    bits = np.unpackbits(aligned.view(np.uint8)).reshape(-1, 32)
++    used = np.arange(32, dtype=np.int64)[None, :] < sizes[:, None]
++    return np.packbits(bits[used])
++
++
++def _crc8(data: bytes | bytearray) -> int:
++    crc = 0
++    for byte in data:
++        crc ^= byte
++        for _ in range(8):
++            crc = ((crc << 1) ^ 0x07) & 0xFF if crc & 0x80 else crc << 1
++    return crc
++
++
++_CRC16_POWERS: dict[str, Any] = {}
++
++
++def _crc16(data: np.ndarray) -> int:
++    """CRC-16 (polynomial 0x8005, start 0) as FLAC frames carry it."""
++    powers = _CRC16_POWERS.get("table")
++    if powers is None:
++        table = np.zeros(CRC16_PERIOD, dtype=np.uint16)
++        value = 1
++        for exponent in range(CRC16_PERIOD):
++            table[exponent] = value
++            value <<= 1
++            if value & 0x10000:
++                value ^= 0x18005
++        powers = _CRC16_POWERS["table"] = table
++    bits = np.unpackbits(data)
++    exponents = (len(bits) - 1 - np.flatnonzero(bits) + 16) % CRC16_PERIOD
++    return int(np.bitwise_xor.reduce(powers[exponents])) if len(exponents) else 0
+diff --git a/tests/core/test_perfect_flac.py b/tests/core/test_perfect_flac.py
+new file mode 100644
+index 000000000..1b7add540
+--- /dev/null
++++ b/tests/core/test_perfect_flac.py
+@@ -0,0 +1,218 @@
++"""Tests for Perfect FLAC: the size estimate and the exact-length stream."""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import shutil
++import subprocess
++from typing import TYPE_CHECKING
++
++import numpy as np
++import pytest
++
++from music_assistant.helpers import perfect_flac as pf
++
++if TYPE_CHECKING:
++    from collections.abc import AsyncGenerator
++    from pathlib import Path
++
++FFMPEG = shutil.which("ffmpeg")
++needs_ffmpeg = pytest.mark.skipif(FFMPEG is None, reason="ffmpeg not installed")
++LOGGER = logging.getLogger(__name__)
++
++
++def _crc16_reference(data: bytes) -> int:
++    crc = 0
++    for byte in data:
++        crc ^= byte << 8
++        for _ in range(8):
++            crc = ((crc << 1) ^ 0x8005) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
++    return crc
++
++
++def test_crc16_matches_reference() -> None:
++    """The vectorized CRC-16 equals the bitwise one."""
++    rng = np.random.default_rng(1)
++    for size in (1, 2, 17, 4096, 20001):
++        data = rng.integers(0, 256, size, dtype=np.uint8)
++        assert pf._crc16(data) == _crc16_reference(data.tobytes())
++
++
++def test_pack_bits() -> None:
++    """Fields are packed most significant bit first."""
++    packed = pf._pack_bits(np.array([0b101, 0, 0xFFFF, 1]), np.array([3, 0, 16, 2]))
++    assert packed.tobytes() == bytes([0b10111111, 0b11111111, 0b11101000])
++
++
++@pytest.mark.parametrize(
++    ("float_stage", "changed", "dynamic", "pcm", "out", "expected"),
++    [
++        (False, False, False, 16, 16, "R0"),
++        (False, False, False, 24, 16, "R3"),
++        (False, True, False, 24, 24, "R2"),
++        (True, False, False, 32, 24, "R1"),
++        (True, True, False, 32, 24, "R2"),
++        (True, True, False, 32, 16, "R3"),
++        (True, True, True, 32, 24, "R4"),
++    ],
++)
++def test_get_regime(
++    float_stage: bool, changed: bool, dynamic: bool, pcm: int, out: int, expected: str
++) -> None:
++    """The regime follows the float stage, sample changes and output depth."""
++    assert (
++        pf.get_regime(
++            float_stage=float_stage,
++            samples_changed=changed,
++            dynamic_normalization=dynamic,
++            pcm_bit_depth=pcm,
++            output_bit_depth=out,
++        )
++        == expected
++    )
++
++
++def _ratio(**overrides: object) -> float | None:
++    args: dict[str, object] = {
++        "source_size": 30_000_000,
++        "source_is_flac": True,
++        "source_rate": 44100,
++        "source_bit_depth": 16,
++        "source_channels": 2,
++        "output_rate": 44100,
++        "output_bit_depth": 16,
++        "output_channels": 2,
++        "duration": 240.0,
++        "regime": "R0",
++        "gain_db": 0.0,
++    }
++    args.update(overrides)
++    return pf.estimate_flac_ratio(**args)  # type: ignore[arg-type]
++
++
++def test_estimate_flac_ratio() -> None:
++    """V2: source bits per sample plus an offset, by regime."""
++    bits = 30_000_000 / (44100 * 2 * 2 * 240.5) * 16
++    assert _ratio() == pytest.approx((bits + 0.57) / 16)
++    assert _ratio(regime="R1", output_bit_depth=24) == pytest.approx((bits + 0.77) / 24)
++    assert _ratio(regime="R2", output_bit_depth=24, gain_db=-6.02) == pytest.approx(
++        (bits + 8 - 1 + 0.57) / 24
++    )
++    assert _ratio(source_is_flac=False) is None
++    assert _ratio(source_size=None) is None
++    assert _ratio(regime="R4") is None
++
++
++def test_estimate_flac_size_adds_margin() -> None:
++    """The announced size is the estimate plus the margin."""
++    announced, estimate = pf.estimate_flac_size(
++        ratio=0.7, output_rate=44100, output_bit_depth=16, output_channels=2, seconds=100
++    )
++    assert estimate == int(0.7 * 176400 * 100.5)
++    assert announced == int(estimate * (1 + pf.MARGIN_MODEL))
++
++
++def _encode(tmp_path: Path, bit_depth: int, seconds: int = 25) -> bytes:
++    assert FFMPEG
++    out = tmp_path / f"t{bit_depth}.flac"
++    source = (
++        f"sine=frequency=330:sample_rate=44100:duration={seconds},"
++        "aformat=channel_layouts=stereo,tremolo=f=0.2:d=0.9[a];"
++        f"anoisesrc=color=pink:sample_rate=44100:duration={seconds}:amplitude=0.2:seed=7,"
++        "aformat=channel_layouts=stereo[b];[a][b]amix=inputs=2:normalize=0"
++    )
++    args = [FFMPEG, "-v", "error", "-y", "-filter_complex", source]
++    args += ["-sample_fmt", "s16" if bit_depth == 16 else "s32", "-f", "flac"]
++    args += ["-compression_level", "0", "-frame_size", "4096", str(out)]
++    subprocess.run(args, check=True)  # noqa: S603
++    return out.read_bytes()
++
++
++def _decode(data: bytes) -> bytes:
++    assert FFMPEG
++    args = [FFMPEG, "-v", "error", "-err_detect", "crccheck+explode", "-f", "flac", "-i", "-"]
++    result = subprocess.run(  # noqa: S603
++        [*args, "-f", "s32le", "-"], input=data, capture_output=True, check=True
++    )
++    assert not result.stderr
++    return result.stdout
++
++
++async def _decoder(
++    audio: AsyncGenerator[bytes], rate: int, bit_depth: int, channels: int
++) -> AsyncGenerator[bytes]:
++    assert FFMPEG
++    assert rate
++    assert channels
++    proc = await asyncio.create_subprocess_exec(
++        *[FFMPEG, "-v", "error", "-f", "flac", "-i", "-"],
++        *["-f", "s16le" if bit_depth == 16 else "s32le", "-"],
++        stdin=asyncio.subprocess.PIPE,
++        stdout=asyncio.subprocess.PIPE,
++    )
++    assert proc.stdin
++    assert proc.stdout
++    stdin, stdout = proc.stdin, proc.stdout
++
++    async def _feed() -> None:
++        async for chunk in audio:
++            stdin.write(chunk)
++            await stdin.drain()
++        stdin.close()
++
++    feeder = asyncio.create_task(_feed())
++    while chunk := await stdout.read(65536):
++        yield chunk
++    await feeder
++    await proc.wait()
++
++
++async def _run(
++    data: bytes, target: int, seconds: float, expected: int
++) -> tuple[bytes, pf.PerfectFlacResult]:
++    async def _source() -> AsyncGenerator[bytes]:
++        for pos in range(0, len(data), 7001):
++            yield data[pos : pos + 7001]
++            await asyncio.sleep(0)
++
++    stream = pf.PerfectFlacStream(
++        _source(), pf.PerfectFlacPlan(target, expected, seconds), LOGGER, _decoder
++    )
++    out = bytearray()
++    async for chunk in stream.stream():
++        out += chunk
++    return bytes(out), stream.result
++
++
++@needs_ffmpeg
++@pytest.mark.parametrize("bit_depth", [16, 24])
++@pytest.mark.parametrize("gap", [0, 0.004, 0.03, 0.15, 0.4])
++async def test_stream_ends_on_announced_size(tmp_path: Path, bit_depth: int, gap: float) -> None:
++    """The stream ends on the announced byte and decodes to the same samples."""
++    data = _encode(tmp_path, bit_depth)
++    target = int(len(data) * (1 + gap))
++    out, result = await _run(data, target, 25, int(target / (1 + pf.MARGIN_MODEL)))
++    assert result.status == "exact"
++    assert len(out) == target
++    assert result.natural == len(data)
++    assert _decode(out) == _decode(data)
++    if gap == 0:
++        assert out == data
++
++
++@needs_ffmpeg
++async def test_stream_larger_than_announced_is_untouched(tmp_path: Path) -> None:
++    """A stream that is larger than announced passes through unchanged."""
++    data = _encode(tmp_path, 16)
++    out, result = await _run(data, len(data) - 1000, 25, len(data))
++    assert result.status == "over"
++    assert out == data
++
++
++async def test_other_data_passes_through() -> None:
++    """Data that is not FLAC passes through unchanged."""
++    data = bytes(range(256)) * 400
++    out, result = await _run(data, len(data) + 5000, 10, len(data))
++    assert out == data
++    assert result.status == "short"
