@@ -83,3 +83,14 @@ Two papers on predicting encoder output size, used for the study design:
 - Premkumar, Rajendran, Menon, Herglotz (2026).
   *Content-Driven Frame-Level Bit Prediction for Rate Control in Versatile Video Coding.*
   https://arxiv.org/abs/2602.06242
+
+Papers citing the first one, read for modelling practice (grouped and repeated cross-validation,
+checking a closed-form model on a mixed population, limiting the cost of a wrong prediction):
+
+- Xiong, Chen, Wei, Wu, Sethuraman (2026). *Dynamic resolution switching for live streaming.*
+  https://arxiv.org/abs/2605.15490
+- Reznik (2026). *A Quantization Problem Posed by Adaptive Streaming.*
+  https://arxiv.org/abs/2609.03745
+- Soltanayev, Zisimopoulos, Anam, Kung, Katsenou, Andreopoulos (2025).
+  *Content Adaptive Encoding For Interactive Game Streaming.*
+  https://arxiv.org/abs/2511.22327
