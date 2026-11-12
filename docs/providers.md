@@ -10,32 +10,42 @@ a `size=` argument. 72 providers implement `get_stream_details`; `music247e` bui
 elsewhere and was not scanned. "Lossless" is read from the content types and quality names in
 each provider's code. Only Tidal was measured against the service.
 
-## Supplies a source size today
+## Checklist
 
-| Provider | Where the size comes from | Lossless | Note |
-|---|---|---|---|
-| filesystem_local (local, SMB, NFS) | file size from stat | yes | includes tags and cover art |
-| webdav, Google Drive, OneDrive, Yandex Disk | file size from the listing, through the shared file-system base | yes | inherited; not run |
-| deezer | `FILESIZE_<format>` from the track API | yes (FLAC tier) | set on 2 of its 5 constructions |
-| feiniu_music | `size` from the API | yes | |
-| audible, storytel | size from the API | no (audiobooks) | lossy source |
+- **Available now**: the provider already sets `StreamDetails.size`.
+- **Available with provider update**: the service can give a size, the provider does not
+  pass it on yet. `yes` = measured against the service; `expected` = follows from how the
+  provider streams (a plain HTTP file URL), not tested, needs an account.
+- **Unavailable**: no known way to a size before the stream starts.
 
-## Lossless, no size today
+| Provider | Lossless | Available now | Available with provider update | Unavailable | How / note |
+|---|---|---|---|---|---|
+| filesystem_local (local, SMB, NFS) | yes | yes | | | file size from stat; includes tags and cover art |
+| webdav | yes | yes | | | size from the listing, through the shared file-system base; not run |
+| Google Drive, OneDrive, Yandex Disk | yes | yes | | | same shared base; not run |
+| deezer | yes (FLAC tier) | yes | | | `FILESIZE_<format>` from the track API; set on 2 of its 5 constructions |
+| feiniu_music | yes | yes | | | `size` from the API |
+| audible, storytel | no (audiobooks) | yes | | | size from the API; lossy source |
+| tidal | yes | | yes | | manifest + 1 HEAD, or sum of segment sizes; measured on 100 tracks (below) |
+| internet_archive | sometimes | | yes | | the metadata API the provider already calls has `size` per file; HEAD gives the same number (19 of 19 FLAC files, no login) |
+| phishin | no (MP3) | | yes | | HEAD on the MP3 URL returns `Content-Length` (4 of 4, no login); lossy source |
+| qobuz | yes | | expected | | HTTP file URL: HEAD |
+| jellyfin, emby, opensubsonic | yes | | expected | | HTTP: HEAD, or the server's own size field (not checked) |
+| plex, direct play | yes | | expected | | HTTP: HEAD |
+| nugs, ibroadcast | sometimes | | expected | | HTTP: HEAD |
+| qqmusic, neteasecloudmusic, zvuk_music | FLAC tiers | | expected | | HTTP: HEAD |
+| kion_music, yandex_music | FLAC tiers | | expected | | HEAD where the stream is HTTP; their custom streams unknown |
+| plex, transcode | no (Opus HLS) | | | yes | transcoded on the fly |
+| apple_music | yes (ALAC) | | | yes | encrypted HTTP |
+| spotify, spotify_connect | lossless tier | | | yes | audio comes through librespot, no file URL |
 
-| Provider | Stream | Way to a size |
-|---|---|---|
-| tidal | DASH manifest served by MA | manifest + 1 HEAD, or sum of segment sizes (measured, below) |
-| qobuz | HTTP file URL | HEAD on the URL (not tested) |
-| jellyfin, emby, opensubsonic | HTTP | HEAD, or the server's own size field (not checked) |
-| plex (direct play) | HTTP | same; the Opus HLS transcode path has none |
-| nugs, internet_archive, ibroadcast | HTTP | HEAD (not tested) |
-| qqmusic, neteasecloudmusic, zvuk_music | HTTP | HEAD (not tested) |
-| kion_music, yandex_music | HTTP or custom | HEAD where HTTP (not tested) |
-| apple_music | encrypted HTTP | none known |
-| spotify (lossless tier), spotify_connect | custom (librespot) | none known |
+Not listed: lossy-only catalogues (ytmusic, soundcloud, bandcamp, pandora, musicme, nicovideo),
+podcasts, radio and live streams, and the plugin sources. A lossy or endless source has no size
+that helps a FLAC estimate.
 
-Not relevant: lossy-only catalogues, podcasts and audiobooks, radio and live streams, and the
-plugin sources. A lossy or endless source has no size that helps a FLAC estimate.
+Probes without a login, 2026-11-12: Internet Archive, 19 FLAC files from 12 items (HEAD 200 after
+one redirect, `Content-Length` equal to the metadata `size`, ranged GET answered 206 with the
+same total); phish.in, 4 tracks.
 
 ## Tidal
 
