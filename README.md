@@ -1,0 +1,55 @@
+# Predictive Encoding for Music Assistant File Size Estimation
+
+Work in progress: a better estimate of the FLAC stream size that
+[Music Assistant](https://github.com/music-assistant/server) announces in the HTTP
+`Content-Length` header, to replace the fixed factor 0.747.
+
+- [Findings so far](docs/findings.md)
+- [Comparison: 0.747 vs v1 vs V2](docs/comparison.md)
+- [Model parameters explained](docs/model.md)
+- Model files: [v1](models/model_v1.json), [V2](models/model_v2.json)
+- Survey script: [flac_size_survey.py](flac_size_survey.py)
+
+## Survey script usage
+
+```
+Measures how large Music Assistant's FLAC streams are for a sample of your library.
+Read-only: it never changes, moves or uploads your music.
+
+FLAC_SIZE_SURVEY music_folder [--out folder] [--sample N] [--jobs N] [--hours H]
+                 [--new] [--seed N] [--dyn-every N] [--genre] [--selftest] [--force]
+                 [--ffmpeg path] [--ffprobe path]
+
+  music_folder    Top folder of your music library.
+  --out folder    Where the result files go. Default: survey_out
+  --sample N      How many tracks to measure. Default: 20000. 0 = scan only.
+  --jobs N        Tracks measured at once. Default: CPU cores / 3.
+  --hours H       Stop cleanly after H hours. Run the same command again to continue.
+  --new           Start another run with a new random seed (a different sample).
+  --seed N        Use this seed. Repeats that run, or continues it if unfinished.
+  --dyn-every N   Measure the slow "dynamic loudness" setting on 1 track in N. Default: 5.
+  --genre         Also record each track's genre tag. Off by default.
+  --selftest      Only check ffmpeg and run the 10-second self-test, then exit.
+  --force         Do not stop if a start-up check fails; record it and run anyway.
+  --ffmpeg path   The ffmpeg program, or the folder holding ffmpeg and ffprobe.
+                  Default: whatever "ffmpeg" is on PATH.
+  --ffprobe path  The ffprobe program, if it is not next to ffmpeg.
+
+Examples:
+  python3 flac_size_survey.py /mnt/music
+  python3 flac_size_survey.py /mnt/music --selftest
+  python3 flac_size_survey.py /mnt/music --out /tmp/survey --hours 8
+  /opt/python3.12/bin/python3 flac_size_survey.py /mnt/music --ffmpeg /opt/ffmpeg/bin
+
+Needs Python 3.8+ and ffmpeg + ffprobe (built with libsoxr). Nothing else.
+To use a particular Python, start the script with it, as in the last example.
+Safe to stop with Ctrl-C and run again: finished work is kept.
+
+Each run picks its sample with a random seed. The seed is saved and is part of the
+file names, so runs never overwrite each other.
+
+When it finishes, send back these four files from the output folder (SEED is a number):
+  scan.jsonl.gz  sample-SEED.jsonl  results-SEED.jsonl  meta-SEED.json
+Do NOT send paths.local.json: it holds your file names.
+
+```

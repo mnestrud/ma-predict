@@ -1,0 +1,58 @@
+{
+ "name": "v2",
+ "frozen": "2026-11-12",
+ "basis": "v1's form; offsets in bits per sample, fitted on 50 development artists (1,399 rows, artist-grouped 5-fold CV, per-fold offsets 0.55-0.58 and 0.76-0.78). Locked test artists not read. Script: v2.py.",
+ "duration": "d = floored duration + 0.5 s",
+ "src_bits": "size / (rate_src * bps_src/8 * ch_src * d) * bps_src",
+ "gain": "normalization gain + DSP gain filter dB + half the balance attenuation in dB (EQ preamp, tone, pass filters, limiter: not counted)",
+ "bits": {
+  "R0": "src_bits",
+  "R1": "src_bits",
+  "R2": "src_bits + max(bps_out - bps_src, 0) + gain/6.02",
+  "R3": "src_bits - max(bps_src - 16, 0) + gain/6.02",
+  "R4 (dynamic loudnorm), 24-bit out": "as R2 with gain 0",
+  "resample": "+ resample_c * log2(rate_src / rate_out) when rate_out < rate_src"
+ },
+ "ratio": "clamp(((bits + offset) * ch_src / ch_out + mono_dither) / bps_out, 0.02, 1.01)",
+ "fitted": {
+  "offset_bits": 0.57,
+  "offset_padded_bits": 0.77
+ },
+ "offset_padded_bits_when": "R1 with bps_out > bps_src (16-bit source zero-padded into 24 bits)",
+ "provisional": {
+  "resample_c": {
+   "value": 2.6,
+   "basis": "5 tracks, one artist"
+  },
+  "mono_dither_bits": {
+   "value": 1.65,
+   "when": "R3, one-channel source to two-channel output",
+   "basis": "24 constructed one-channel files (rule-testing set, not the fitting set)"
+  },
+  "padded_guard_bits": {
+   "value": 13.0,
+   "when": "source deeper than 16 bits, src_bits below this, samples changed (R2/R3/R4): use 0.747",
+   "basis": "private-library 24-bit minimum 12.35 (31 tracks, 5 artists); constructed 16-in-24 maximum 12.99"
+  }
+ },
+ "fallback_0.747": [
+  "lossy or uncompressed source",
+  "unknown size",
+  "R4 with 16-bit output (not measured)",
+  "padded guard"
+ ],
+ "known_limits": [
+  "20 bits in a 24-bit file above the guard: short by 21-45 %",
+  "limiter as the only sample-changing filter: long by 16-44 %",
+  "stereo file with identical channels plus gain: long by 44-50 %; with 16-bit output short by 18 %",
+  "balance at 100: long by about 2x",
+  "low-pass 8 kHz: long by 7 % (up to 16 %)",
+  "band-limited old recordings: short by up to 16 %",
+  "applied crossfade not modelled"
+ ],
+ "resample_c": 2.6,
+ "mono_dither_bits": 1.65,
+ "padded_guard_bits": 13.0,
+ "offset_bits": 0.57,
+ "offset_padded_bits": 0.77
+}

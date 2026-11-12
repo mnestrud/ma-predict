@@ -1,0 +1,31 @@
+{
+ "name": "v1",
+ "frozen": "2026-11-11",
+ "basis": "v0 plus terms from first principles, checked on the 330 tracks of a private library (ffmpeg 9.0.1, core set). Offsets unchanged from v0.",
+ "inputs": "source size (whole file), floored integer duration, source bps/rate/channels, output bps/rate/channels, regime (R0-R4), summed gain dB, playback speed, seek",
+ "duration": "d = floored duration + 0.5 s; effective length = (d - seek) / speed",
+ "src_bits": "src_ratio * bps_src, with src_ratio = size / (rate_src * bps_src/8 * ch_src * d)",
+ "bits_out": {
+  "R0": "src_bits",
+  "R1": "src_bits",
+  "R2": "src_bits + max(bps_out - bps_src, 0) + gain/6.02",
+  "R3": "src_bits - max(bps_src - 16, 0) + gain/6.02",
+  "resample": "+ c * log2(rate_src / rate_out) when rate_out < rate_src"
+ },
+ "resample_c": {
+  "value": 2.6,
+  "status": "PROVISIONAL: 5 tracks, one artist (96 kHz -> 48 kHz); to be set from the admin library"
+ },
+ "ratio": "clamp(bits_out / bps_out * ch_src / ch_out + offset[bps_out], 0.02, 1.01)",
+ "offset": {
+  "16": 0.0371,
+  "24": 0.0235
+ },
+ "fallback": "0.747 for R4 (dynamic loudnorm), lossy or uncompressed sources, unknown size, DSP other than plain gains",
+ "not_included": [
+  "bits the source really uses (not known before headers)",
+  "art/padding bytes",
+  "source compression level",
+  "EQ correction (waits for DSP screening)"
+ ]
+}
